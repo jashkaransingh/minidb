@@ -179,3 +179,82 @@ defeats the append-only write path. Documented on the method rather than quietly
 
 Milestone 3 — bloom filters: one per table, written into the reserved section, probed before any data
 read so a miss costs a few in-memory bit tests instead of a full scan.
+
+---
+
+## Milestone 3 — Bloom filters
+
+**Status:** complete. Build, test, clippy (`-D warnings`), and fmt all clean. 111 tests pass.
+
+### What was built
+
+`src/bloom.rs`, previously a `todo!()` stub, is now a working filter, and every SSTable carries one
+in the section reserved for it in milestone 2.
+
+- **`BloomFilter::new(expected_keys, fp_rate)`** — sizes `m` and `k` from the standard formulas
+  (`m = -n·ln p / (ln 2)²`, `k = (m/n)·ln 2`), clamped against degenerate inputs.
+- **`insert` / `contains`**, plus `insert_hashed` / `contains_hashed` taking a precomputed hash pair.
+- **`encode` / `decode`** — `crc32 | k | num_bits | words…`, self-checksummed.
+- **Diagnostics** — `fill_ratio`, `estimated_fp_rate`, `num_bits`, `num_hashes`, `size_bytes`.
+- `SsTableWriter` hashes each key during `append` and builds the filter at `finish`.
+- `SsTable::get` probes range → bloom → data scan, cheapest first.
+
+### Key design decisions, and why
+
+**The hash function is pinned in this crate, not taken from `std`.** This is the most important
+decision in the milestone. Filters are serialized into SSTables and read back by whatever binary
+opens the store later. `DefaultHasher` explicitly does not guarantee a stable algorithm across Rust
+releases — so a store written by one build and read by another could probe *different bits*, and the
+filter would start reporting **false negatives**. A false negative means a read returns "not found"
+for data that is really on disk: silent, permanent-looking data loss that no checksum would catch.
+So the hash is FNV-1a with two offset bases, each finalized through MurmurHash3's `fmix64`, entirely
+defined in `bloom.rs` and stable by construction.
+
+**FNV-1a alone was not good enough.** It avalanches poorly in the high bits, and the probe index is
+`(h1 + i·h2) % num_bits` — so weak high bits translate directly into clustered probes and a worse
+false-positive rate. The `fmix64` finalizer fixes the distribution for a few ns per key.
+
+**`h2` is forced odd.** Without it, an `h2` sharing factors with `num_bits` collapses the probe
+sequence onto a short cycle, so `k` probes can hit far fewer than `k` distinct bits. There is a test
+asserting this property directly.
+
+**The filter is built at `finish`, not at `create`.** Sizing needs `n`, and `n` is not known until
+the last key has been appended. The writer therefore stores one `(h1, h2)` pair per key — 16 bytes,
+bounded by the memtable size — and builds an exactly-sized filter at the end. Guessing at `create`
+time would mean either a bloated filter or one far off its target rate.
+
+**A corrupt filter degrades to no filter.** `BloomFilter::decode` returns `None` on a checksum
+failure, and `SsTable::open` treats that as "no filter available" rather than failing the open. The
+data section is independently checksummed and remains authoritative, so the cost of corruption here
+is a slower read, never a wrong answer. Trusting a corrupt filter would risk false negatives.
+
+**Empty tables get no filter.** `bloom_len = 0`, and readers handle that already — which also means
+tables written in milestone 2, before filters existed, still open and read correctly. No format
+version bump was needed; the change is purely additive.
+
+### What is tested
+
+15 unit tests in `bloom.rs` and 8 integration tests in `sstable.rs`:
+
+- **No false negatives** across 1 000 keys — the property everything else depends on.
+- Measured false-positive rate stays under 3% against a 1% target over 20 000 trials.
+- Sizing matches the formula (~9.6 bits/key, k=7 at 1%); tighter targets produce larger filters.
+- Encode/decode round-trip preserves *identical* answers, including on absent keys.
+- Corrupt and truncated encodings are rejected.
+- `h2` is always odd; hashing is deterministic.
+- Degenerate parameters (0 keys, `fp_rate` 0.0 and 1.0) still produce usable filters.
+- In-table: tombstones are in the filter (or deletes would stop shadowing); empty tables carry none;
+  a corrupted filter section still yields correct reads; the filter rejects >90% of absent keys; the
+  filter is <5% of table size.
+
+### Known limitations (deliberate)
+
+- **Hits are still O(n) per table** — the data scan is unchanged. Milestone 4.
+- `num_inserted` is not serialized, so a decoded filter reports 0 for it. `estimated_fp_rate` uses
+  the observed fill ratio instead, which works either way.
+- Tables still accumulate without bound. Milestone 5.
+
+### Next
+
+Milestone 4 — sparse block index: group entries into blocks, record `(first_key, offset)` per block
+in the reserved index section, and binary-search it so a hit reads one block instead of scanning.

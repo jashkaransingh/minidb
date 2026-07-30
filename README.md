@@ -37,7 +37,7 @@ This is a work in progress, and the split is sharp:
 | `lib` (`Db` API) | **Working** | In-memory or durable; writes logged + fsynced, memtable flushed to SSTables, reads merged newest-first |
 | `main` (CLI demo) | **Working** | `cargo run` exercises both the in-memory and the write-drop-reopen paths |
 | `sstable` | **Working** | Immutable sorted tables: crc32-checked sections, footer with magic/version, atomic publish via rename |
-| `bloom` | Scaffolded | Signatures + sizing math documented; bodies are `todo!()` |
+| `bloom` | **Working** | Sized from the textbook formula, double hashing, crc32-checked, one per table |
 | `compaction` | Scaffolded | Signatures + leveled strategy documented; bodies are `todo!()` |
 
 **Durable and on disk, but not yet fast on misses.** A store opened with `Db::open` logs every
@@ -45,18 +45,22 @@ mutation, fsyncs before acknowledging it, and flushes the memtable to an immutab
 passes its size threshold. Reads search the memtable and then each table newest-first, stopping at
 the first value or tombstone. Acknowledged writes survive a crash.
 
-The honest gap: `SsTable::get` currently **scans the data section sequentially**, so a lookup is O(n)
-per table and a miss touches every table. The file format already reserves bloom-filter and index
-sections — both currently zero-length — so the next two milestones fill them in rather than changing
-the layout. Tables also accumulate without bound: nothing merges them yet. The `bloom` and
-`compaction` modules are still `todo!()` and will panic if called.
+Each table carries a bloom filter, so a **miss** is now resolved from memory: a key-range check and
+an in-memory bit probe, with no disk read at all. Measured on 2 000 keys, the filter rejects >90% of
+absent keys outright.
 
-89 tests currently pass (`cargo test`).
+The honest gap: a **hit** still costs a sequential scan of the table's data section, because the
+sparse index section is reserved but empty. Lookups of keys that *are* present are therefore O(n) per
+table — milestone 4. Tables also accumulate without bound; nothing merges them yet, so read
+amplification grows with the number of flushes. `compaction` is still `todo!()` and will panic if
+called.
+
+111 tests currently pass (`cargo test`).
 
 ## Architecture
 
-The intended full design. The WAL, memtable, and L0 SSTable boxes are implemented today; the bloom
-filter, the sparse index, and everything at L1 and below are not yet.
+The intended full design. The WAL, memtable, L0 SSTable, and bloom filter boxes are implemented
+today; the sparse index and everything at L1 and below are not yet.
 
 ```
                  WRITE PATH                              READ PATH
@@ -110,7 +114,7 @@ bottom-most level and can safely drop both.
 ┌──────────────────────────────────────────────┐
 │ Data section      entries, ascending keys     │  implemented
 ├──────────────────────────────────────────────┤
-│ Bloom filter      "definitely not here?"      │  reserved, empty
+│ Bloom filter      "definitely not here?"      │  implemented
 ├──────────────────────────────────────────────┤
 │ Sparse index      first key → block offset    │  reserved, empty
 ├──────────────────────────────────────────────┤
@@ -138,7 +142,7 @@ immutable, this is a k-way sequential merge — cheap, restartable, and safe to 
 ```bash
 cargo build     # compile
 cargo run       # demo: in-memory ops, then write / drop / reopen recovery
-cargo test      # 89 tests, unit + integration + doctest
+cargo test      # 111 tests, unit + integration + doctest
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -194,7 +198,7 @@ assert_eq!(recovered.get(b"key"), Some(b"value".to_vec()));
       truncation at the first torn record
 - [x] **SSTable flush** — immutable sorted tables, checksummed sections, atomic publish by rename,
       WAL rotated only once the table is durable
-- [ ] **Bloom filters** — one per table, Kirsch–Mitzenmacher double hashing, so misses skip the read
+- [x] **Bloom filters** — one per table, Kirsch–Mitzenmacher double hashing, so misses skip the read
 - [ ] **Sparse block index** — binary search to a single block instead of scanning the table
 - [ ] **Compaction** — leveled strategy, k-way merge, correct tombstone lifetime
 - [ ] **Concurrent readers/writers** — lock-free reads against immutable tables, single writer

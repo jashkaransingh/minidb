@@ -15,7 +15,7 @@
 //! ┌─────────────────────────────────────────┐ offset 0
 //! │ Data section    entries, ascending keys  │
 //! ├─────────────────────────────────────────┤
-//! │ Bloom section   (empty until milestone 3)│
+//! │ Bloom section   membership filter        │
 //! ├─────────────────────────────────────────┤
 //! │ Index section   (empty until milestone 4)│
 //! ├─────────────────────────────────────────┤
@@ -39,13 +39,19 @@
 //! `kind` is 0 for a value and 1 for a tombstone; tombstones store no value
 //! bytes. A crc32 over the whole data section is recorded in the footer.
 //!
-//! # Current limitation
+//! # Lookup path, and its current limitation
 //!
-//! [`SsTable::get`] scans the data section sequentially — correct, but O(n) per
-//! lookup. The bloom filter (milestone 3) will let misses skip the scan
-//! entirely, and the sparse index (milestone 4) will narrow a hit to a single
-//! block. The file format already reserves both sections so those milestones
-//! extend the format rather than replacing it.
+//! [`SsTable::get`] filters in three stages, cheapest first:
+//!
+//! 1. **Key range** — `min_key`/`max_key` from the meta section rule out keys
+//!    outside the table's span with two comparisons.
+//! 2. **Bloom filter** — an in-memory probe that ends the lookup for almost
+//!    every remaining miss without touching the data section.
+//! 3. **Data scan** — still a sequential walk, so a *hit* costs O(n).
+//!
+//! Stage 3 is the remaining gap. The sparse index (milestone 4) will replace it
+//! with a binary search to a single block; the index section is already reserved
+//! in the layout, so that milestone fills it in rather than changing the format.
 //!
 //! # Durability
 //!
@@ -59,6 +65,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::bloom::{BloomFilter, DEFAULT_FP_RATE, hash_pair};
 use crate::memtable::Entry;
 use crate::wal::sync_parent_dir;
 
@@ -201,6 +208,9 @@ pub struct SsTableWriter {
     num_tombstones: u64,
     min_key: Option<Vec<u8>>,
     last_key: Option<Vec<u8>>,
+    /// One hash pair per appended key, used to size and fill the bloom filter
+    /// at `finish`, when the exact key count is finally known.
+    key_hashes: Vec<(u64, u64)>,
     finished: bool,
 }
 
@@ -225,6 +235,7 @@ impl SsTableWriter {
             num_tombstones: 0,
             min_key: None,
             last_key: None,
+            key_hashes: Vec::new(),
             finished: false,
         })
     }
@@ -264,6 +275,7 @@ impl SsTableWriter {
             self.min_key = Some(key.to_vec());
         }
         self.last_key = Some(key.to_vec());
+        self.key_hashes.push(hash_pair(key));
         Ok(())
     }
 
@@ -275,9 +287,23 @@ impl SsTableWriter {
         let data_crc = self.hasher.clone().finalize();
         let data_len = self.data_len;
 
-        // Bloom and index sections are reserved but empty at this milestone.
+        // Build the filter now: the exact key count is known, so it can be
+        // sized correctly instead of guessed at when the writer was created.
+        let bloom_bytes = if self.key_hashes.is_empty() {
+            Vec::new()
+        } else {
+            let mut filter = BloomFilter::new(self.key_hashes.len(), DEFAULT_FP_RATE);
+            for &(h1, h2) in &self.key_hashes {
+                filter.insert_hashed(h1, h2);
+            }
+            filter.encode()
+        };
+        self.writer()?.write_all(&bloom_bytes)?;
+
         let bloom_off = data_len;
-        let bloom_len = 0u64;
+        let bloom_len = bloom_bytes.len() as u64;
+
+        // Index section is still reserved but empty; filled in by milestone 4.
         let index_off = bloom_off + bloom_len;
         let index_len = 0u64;
 
@@ -358,6 +384,10 @@ pub struct SsTable {
     path: PathBuf,
     footer: Footer,
     meta: TableMeta,
+    /// `None` for tables written before filters existed, or when the stored
+    /// filter fails its checksum. Either way the table stays fully readable —
+    /// a missing filter costs a scan, never a wrong answer.
+    bloom: Option<BloomFilter>,
 }
 
 impl SsTable {
@@ -386,7 +416,27 @@ impl SsTable {
         let mut meta = TableMeta::decode(&meta_bytes)?;
         meta.size_bytes = file_len;
 
-        Ok(Self { path, footer, meta })
+        let bloom = if footer.bloom_len > 0 {
+            if footer.bloom_off + footer.bloom_len > file_len {
+                return Err(corrupt("bloom section extends past end of file"));
+            }
+            let mut bloom_bytes = vec![0u8; footer.bloom_len as usize];
+            file.seek(SeekFrom::Start(footer.bloom_off))?;
+            file.read_exact(&mut bloom_bytes)?;
+            // A corrupt filter degrades to no filter rather than failing the
+            // open: the data section is independently checksummed and still
+            // authoritative.
+            BloomFilter::decode(&bloom_bytes)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            path,
+            footer,
+            meta,
+            bloom,
+        })
     }
 
     /// Looks up `key` in this table.
@@ -399,6 +449,14 @@ impl SsTable {
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Entry>> {
         if !self.may_contain(key) {
             return Ok(None);
+        }
+        // The whole point of carrying a filter: a negative answer here means the
+        // key is definitely absent, so the data section is never touched.
+        if let Some(bloom) = &self.bloom {
+            let (h1, h2) = hash_pair(key);
+            if !bloom.contains_hashed(h1, h2) {
+                return Ok(None);
+            }
         }
         for item in self.iter()? {
             let (k, entry) = item?;
@@ -456,6 +514,16 @@ impl SsTable {
             return false;
         }
         key >= self.meta.min_key.as_slice() && key <= self.meta.max_key.as_slice()
+    }
+
+    /// Borrows this table's bloom filter, if it has a usable one.
+    pub fn bloom(&self) -> Option<&BloomFilter> {
+        self.bloom.as_ref()
+    }
+
+    /// Returns `true` if this table carries a usable bloom filter.
+    pub fn has_bloom(&self) -> bool {
+        self.bloom.is_some()
     }
 
     /// Returns the table's path on disk.
@@ -567,20 +635,23 @@ pub(crate) fn corrupt(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
 
+/// Helpers shared by this file's test modules.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests_support {
     use super::*;
 
-    struct TempDir(PathBuf);
+    /// A scratch directory that removes itself on drop.
+    pub(crate) struct TempDir(pub(crate) PathBuf);
 
     impl TempDir {
-        fn new(tag: &str) -> Self {
+        pub(crate) fn new(tag: &str) -> Self {
             let path = std::env::temp_dir().join(format!("minidb-sst-{tag}"));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }
-        fn file(&self, name: &str) -> PathBuf {
+
+        pub(crate) fn file(&self, name: &str) -> PathBuf {
             self.0.join(name)
         }
     }
@@ -591,7 +662,8 @@ mod tests {
         }
     }
 
-    fn write_table(path: &Path, entries: &[(&str, Option<&str>)]) -> TableMeta {
+    /// Writes a table from `(key, Some(value) | None)` pairs; `None` is a tombstone.
+    pub(crate) fn write_table(path: &Path, entries: &[(&str, Option<&str>)]) -> TableMeta {
         let mut w = SsTableWriter::create(path).unwrap();
         for (k, v) in entries {
             let entry = match v {
@@ -602,6 +674,12 @@ mod tests {
         }
         w.finish().unwrap()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tests_support::*;
+    use super::*;
 
     #[test]
     fn a_written_table_reads_back_every_entry() {
@@ -900,5 +978,173 @@ mod tests {
         assert!(table.may_contain(b"j"), "within range, even if absent");
         assert!(table.may_contain(b"s"));
         assert!(!table.may_contain(b"z"));
+    }
+}
+
+#[cfg(test)]
+mod bloom_integration_tests {
+    use super::tests_support::*;
+    use super::*;
+
+    #[test]
+    fn a_written_table_carries_a_bloom_filter() {
+        let dir = TempDir::new("has-bloom");
+        let path = dir.file("t.sst");
+        write_table(&path, &[("a", Some("1")), ("b", Some("2"))]);
+
+        let table = SsTable::open(&path).unwrap();
+        assert!(table.has_bloom(), "tables should ship a filter");
+        let bloom = table.bloom().unwrap();
+        assert!(bloom.num_bits() > 0);
+        assert!(bloom.num_hashes() > 0);
+    }
+
+    #[test]
+    fn the_filter_reports_every_stored_key_as_present() {
+        let dir = TempDir::new("no-false-negatives");
+        let path = dir.file("t.sst");
+
+        let mut w = SsTableWriter::create(&path).unwrap();
+        for i in 0..1_000u32 {
+            let key = format!("key:{i:05}");
+            w.append(key.as_bytes(), &Entry::Value(b"v".to_vec()))
+                .unwrap();
+        }
+        w.finish().unwrap();
+
+        let table = SsTable::open(&path).unwrap();
+        let bloom = table.bloom().unwrap();
+        for i in 0..1_000u32 {
+            let key = format!("key:{i:05}");
+            assert!(
+                bloom.contains(key.as_bytes()),
+                "false negative would make {key} unreadable"
+            );
+        }
+    }
+
+    #[test]
+    fn lookups_still_return_correct_answers_with_a_filter_in_place() {
+        let dir = TempDir::new("correctness");
+        let path = dir.file("t.sst");
+
+        let mut w = SsTableWriter::create(&path).unwrap();
+        for i in (0..1_000u32).step_by(2) {
+            let key = format!("key:{i:05}");
+            w.append(key.as_bytes(), &Entry::Value(i.to_be_bytes().to_vec()))
+                .unwrap();
+        }
+        w.finish().unwrap();
+
+        let table = SsTable::open(&path).unwrap();
+        // Present keys must be found; absent keys must not, filter or no filter.
+        for i in 0..1_000u32 {
+            let key = format!("key:{i:05}");
+            let got = table.get(key.as_bytes()).unwrap();
+            if i % 2 == 0 {
+                assert_eq!(got, Some(Entry::Value(i.to_be_bytes().to_vec())), "{key}");
+            } else {
+                assert_eq!(got, None, "{key} is not in the table");
+            }
+        }
+    }
+
+    #[test]
+    fn tombstoned_keys_are_in_the_filter_too() {
+        // A tombstone must be findable, or a delete would stop shadowing the
+        // older value beneath it.
+        let dir = TempDir::new("tombstone-bloom");
+        let path = dir.file("t.sst");
+        write_table(&path, &[("dead", None), ("live", Some("v"))]);
+
+        let table = SsTable::open(&path).unwrap();
+        assert!(table.bloom().unwrap().contains(b"dead"));
+        assert_eq!(table.get(b"dead").unwrap(), Some(Entry::Tombstone));
+    }
+
+    #[test]
+    fn an_empty_table_carries_no_filter() {
+        let dir = TempDir::new("empty-bloom");
+        let path = dir.file("t.sst");
+        write_table(&path, &[]);
+
+        let table = SsTable::open(&path).unwrap();
+        assert!(!table.has_bloom(), "no keys means no filter worth writing");
+        assert_eq!(table.get(b"anything").unwrap(), None);
+    }
+
+    #[test]
+    fn a_corrupt_filter_degrades_to_a_scan_rather_than_a_wrong_answer() {
+        let dir = TempDir::new("corrupt-bloom");
+        let path = dir.file("t.sst");
+        write_table(&path, &[("a", Some("1")), ("b", Some("2"))]);
+
+        // Corrupt a byte inside the bloom section, which begins right after the
+        // data section.
+        let table = SsTable::open(&path).unwrap();
+        let bloom_off = table.footer.bloom_off as usize;
+        drop(table);
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[bloom_off + 6] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        let table = SsTable::open(&path).unwrap();
+        assert!(!table.has_bloom(), "corrupt filter must be discarded");
+        // Reads still work, just without the filter's help.
+        assert_eq!(table.get(b"a").unwrap(), Some(Entry::Value(b"1".to_vec())));
+        assert_eq!(table.get(b"b").unwrap(), Some(Entry::Value(b"2".to_vec())));
+        assert_eq!(table.get(b"zzz").unwrap(), None);
+    }
+
+    #[test]
+    fn the_filter_rejects_most_absent_keys_without_a_data_read() {
+        let dir = TempDir::new("effective");
+        let path = dir.file("t.sst");
+
+        let mut w = SsTableWriter::create(&path).unwrap();
+        for i in 0..2_000u32 {
+            let key = format!("present:{i:05}");
+            w.append(key.as_bytes(), &Entry::Value(b"v".to_vec()))
+                .unwrap();
+        }
+        w.finish().unwrap();
+
+        let table = SsTable::open(&path).unwrap();
+        let bloom = table.bloom().unwrap();
+
+        let trials = 5_000u32;
+        let rejected = (0..trials)
+            .filter(|i| !bloom.contains(format!("absent:{i:05}").as_bytes()))
+            .count();
+
+        let reject_rate = rejected as f64 / trials as f64;
+        assert!(
+            reject_rate > 0.90,
+            "filter only rejected {reject_rate:.3} of absent keys; it is not earning its bytes"
+        );
+    }
+
+    #[test]
+    fn the_filter_is_small_relative_to_the_data() {
+        let dir = TempDir::new("size");
+        let path = dir.file("t.sst");
+
+        let mut w = SsTableWriter::create(&path).unwrap();
+        for i in 0..5_000u32 {
+            let key = format!("key:{i:06}");
+            w.append(key.as_bytes(), &Entry::Value(vec![0u8; 64]))
+                .unwrap();
+        }
+        let meta = w.finish().unwrap();
+
+        let table = SsTable::open(&path).unwrap();
+        let bloom_bytes = table.bloom().unwrap().size_bytes() as u64;
+        // ~9.6 bits/key against ~80 bytes/entry of payload.
+        assert!(
+            bloom_bytes * 20 < meta.size_bytes,
+            "filter is {bloom_bytes} bytes against a {} byte table",
+            meta.size_bytes
+        );
     }
 }
