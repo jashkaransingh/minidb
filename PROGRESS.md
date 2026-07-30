@@ -258,3 +258,86 @@ version bump was needed; the change is purely additive.
 
 Milestone 4 — sparse block index: group entries into blocks, record `(first_key, offset)` per block
 in the reserved index section, and binary-search it so a hit reads one block instead of scanning.
+
+---
+
+## Milestone 4 — Sparse block index
+
+**Status:** complete. Build, test, clippy (`-D warnings`), and fmt all clean. 124 tests pass.
+
+### What was built
+
+The data section is now divided into ~4 KiB **blocks**, and the index section reserved in milestone 2
+holds one entry per block: `(first_key, offset, len)`.
+
+- **Writer** — opens a block lazily on its first entry, closes it once it passes
+  `BLOCK_TARGET_BYTES`, and always closes on a whole-entry boundary. The trailing short block is
+  closed at `finish`.
+- **Index encoding** — `crc32 | count | (key_len, key, offset, len)…`, self-checksummed.
+- **Reader** — loads the index on open; `find_block` binary-searches it, `get_in_block` reads exactly
+  that block and scans it.
+
+`SsTable::get` is now four stages: key range → bloom → binary search → one block read.
+
+### Key design decisions, and why
+
+**Blocks close on entry boundaries, never mid-entry.** A block is read and parsed in isolation, so an
+entry split across two blocks would be unparseable without stitching. Closing only after a complete
+entry means `block.len` slightly overshoots the 4 KiB target rather than truncating — the right
+trade, since the alternative is a format that cannot be read one block at a time.
+
+**The index records each block's *first* key, and lookup takes the last block whose first key is
+`<= key`.** This is the subtle part. A key that falls in a *gap* between two blocks' key ranges
+sorts after block N's first key and before block N+1's, so the search lands on block N and finds
+nothing there — the correct answer. Taking the *first* block with `first_key >= key` instead would
+skip past the block that actually contains the key. `Err(0)` from the binary search means the key
+sorts before every block, so the table cannot contain it.
+
+**Blocks are opened lazily, on their first entry.** The index needs the block's real first key, and
+that is not known until an entry arrives. Recording it eagerly at block-close time would mean storing
+the *previous* block's last key, which is a different and wrong thing.
+
+**A corrupt index degrades to a full scan, exactly like the bloom filter.** `decode_index` returns
+`None` on a checksum failure and the reader falls back to `get_by_scan`. Both optional structures
+follow the same rule: they may make reads faster, never make them wrong. This also means milestone 2
+tables, which have `index_len = 0`, still open and read correctly — no format version bump was
+needed.
+
+**Index entries are validated against the data section before use.** `get_in_block` rejects an entry
+whose `offset + len` exceeds `data_len` rather than issuing a wild read.
+
+### What is tested
+
+13 tests in `src/sstable.rs`:
+
+- A 1 000-key table produces many blocks, and the index is genuinely sparse (blocks < keys/5).
+- **Every key findable** through the index across 1 000 keys.
+- **Gap keys return `None`** — a table of only even keys, probed with all the odd ones.
+- Keys sorting before all blocks and after all blocks return `None`.
+- **Block boundaries**: every block's own first key is findable (the case a binary search most easily
+  gets wrong).
+- The index tiles the data section exactly — contiguous, non-overlapping, ascending, summing to
+  `data_len`.
+- First index entry matches `meta.min_key` at offset 0.
+- Small tables get exactly one block; empty tables get no index.
+- Tombstones remain findable through the index.
+- A corrupted index section is discarded and reads still return correct answers via the fallback.
+- Index encoding round-trips; corrupt and truncated encodings are rejected.
+- A lookup's candidate block is <2× the block target and <10% of the data section.
+
+### Known limitations (deliberate)
+
+- **Tables accumulate without bound.** This is now the dominant problem: every flush adds a table,
+  reads may consult all of them, and superseded values and tombstones are never reclaimed. Milestone
+  5.
+- No block-level checksums — integrity is a single crc32 over the whole data section, so `verify()`
+  is all-or-nothing rather than per-block.
+- No prefix compression within blocks; keys are stored whole.
+- `get_in_block` opens the file per lookup. A file-handle or block cache would help, but that is a
+  performance concern, not a correctness one.
+
+### Next
+
+Milestone 5 — compaction: size-tiered merging of overlapping tables, with the tombstone-lifetime rule
+handled correctly (a tombstone may only be dropped when no older table can still hold a value for
+that key).

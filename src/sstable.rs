@@ -17,7 +17,7 @@
 //! ├─────────────────────────────────────────┤
 //! │ Bloom section   membership filter        │
 //! ├─────────────────────────────────────────┤
-//! │ Index section   (empty until milestone 4)│
+//! │ Index section   sparse: block first keys │
 //! ├─────────────────────────────────────────┤
 //! │ Meta section    counts, min/max key      │
 //! ├─────────────────────────────────────────┤
@@ -39,19 +39,25 @@
 //! `kind` is 0 for a value and 1 for a tombstone; tombstones store no value
 //! bytes. A crc32 over the whole data section is recorded in the footer.
 //!
-//! # Lookup path, and its current limitation
+//! # Lookup path
 //!
-//! [`SsTable::get`] filters in three stages, cheapest first:
+//! [`SsTable::get`] filters in four stages, cheapest first:
 //!
 //! 1. **Key range** — `min_key`/`max_key` from the meta section rule out keys
 //!    outside the table's span with two comparisons.
 //! 2. **Bloom filter** — an in-memory probe that ends the lookup for almost
 //!    every remaining miss without touching the data section.
-//! 3. **Data scan** — still a sequential walk, so a *hit* costs O(n).
+//! 3. **Sparse index** — a binary search over one entry per block identifies the
+//!    single block that could hold the key.
+//! 4. **Block scan** — read that one block and walk it.
 //!
-//! Stage 3 is the remaining gap. The sparse index (milestone 4) will replace it
-//! with a binary search to a single block; the index section is already reserved
-//! in the layout, so that milestone fills it in rather than changing the format.
+//! So a lookup costs one disk read, and a miss usually costs none. The index is
+//! *sparse* — one entry per ~4 KiB block, not per key — which keeps it small
+//! enough to hold in memory for every open table.
+//!
+//! Both the filter and the index are optional at read time. If either section is
+//! missing or fails its checksum, the reader falls back to scanning the data
+//! section: slower, but never a wrong answer.
 //!
 //! # Durability
 //!
@@ -83,6 +89,80 @@ const KIND_TOMBSTONE: u8 = 1;
 
 /// Bytes of fixed header preceding each data entry's payload.
 const ENTRY_HEADER_LEN: usize = 1 + 4 + 4;
+
+/// Target size of a data block, in bytes.
+///
+/// Blocks are the unit a point lookup reads. Smaller blocks mean less wasted
+/// I/O per lookup but a larger index; 4 KiB matches a typical page and keeps the
+/// index at roughly one entry per few dozen keys.
+pub const BLOCK_TARGET_BYTES: usize = 4096;
+
+/// One sparse-index entry: the first key of a block, and where that block lives.
+///
+/// Sparse means one entry per *block*, not per key — which is what keeps the
+/// whole index small enough to hold in memory for every open table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexEntry {
+    pub first_key: Vec<u8>,
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Serializes the sparse index: `crc32 | count | (key_len, key, offset, len)…`.
+fn encode_index(entries: &[IndexEntry]) -> Vec<u8> {
+    let mut buf = vec![0u8; 4]; // checksum patched in below
+    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        buf.extend_from_slice(&(entry.first_key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&entry.first_key);
+        buf.extend_from_slice(&entry.offset.to_le_bytes());
+        buf.extend_from_slice(&entry.len.to_le_bytes());
+    }
+    let crc = crc32fast::hash(&buf[4..]);
+    buf[..4].copy_from_slice(&crc.to_le_bytes());
+    buf
+}
+
+/// Parses a sparse index, returning `None` if it is malformed or corrupt.
+///
+/// A `None` here is not fatal: the caller falls back to scanning the data
+/// section, which is slower but still correct.
+fn decode_index(bytes: &[u8]) -> Option<Vec<IndexEntry>> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let stored_crc = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    if crc32fast::hash(&bytes[4..]) != stored_crc {
+        return None;
+    }
+
+    let count = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+    let mut cursor = 8usize;
+    let mut entries = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        if bytes.len() < cursor + 4 {
+            return None;
+        }
+        let key_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().ok()?) as usize;
+        cursor += 4;
+        if bytes.len() < cursor + key_len + 16 {
+            return None;
+        }
+        let first_key = bytes[cursor..cursor + key_len].to_vec();
+        cursor += key_len;
+        let offset = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().ok()?);
+        cursor += 8;
+        let len = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().ok()?);
+        cursor += 8;
+        entries.push(IndexEntry {
+            first_key,
+            offset,
+            len,
+        });
+    }
+    Some(entries)
+}
 
 /// Statistics recorded in the meta section, used by the compaction planner.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -211,6 +291,10 @@ pub struct SsTableWriter {
     /// One hash pair per appended key, used to size and fill the bloom filter
     /// at `finish`, when the exact key count is finally known.
     key_hashes: Vec<(u64, u64)>,
+    /// Sparse index, one entry per completed data block.
+    index: Vec<IndexEntry>,
+    /// Bytes written into the block currently being filled.
+    block_bytes: usize,
     finished: bool,
 }
 
@@ -236,6 +320,8 @@ impl SsTableWriter {
             min_key: None,
             last_key: None,
             key_hashes: Vec::new(),
+            index: Vec::new(),
+            block_bytes: 0,
             finished: false,
         })
     }
@@ -263,9 +349,26 @@ impl SsTableWriter {
         buf.extend_from_slice(key);
         buf.extend_from_slice(value);
 
+        // A block opens lazily on its first entry, so the index records the real
+        // first key rather than a guess made before it was known.
+        if self.block_bytes == 0 {
+            self.index.push(IndexEntry {
+                first_key: key.to_vec(),
+                offset: self.data_len,
+                len: 0, // patched when the block closes
+            });
+        }
+
         self.writer()?.write_all(&buf)?;
         self.hasher.update(&buf);
         self.data_len += buf.len() as u64;
+        self.block_bytes += buf.len();
+
+        // Blocks close on a whole-entry boundary, so a block can be scanned
+        // without reference to its neighbours.
+        if self.block_bytes >= BLOCK_TARGET_BYTES {
+            self.close_block();
+        }
 
         self.num_entries += 1;
         if matches!(entry, Entry::Tombstone) {
@@ -284,6 +387,11 @@ impl SsTableWriter {
     /// Returns the table's metadata. After this returns `Ok`, the table is
     /// durable and it is safe to rotate the write-ahead log that fed it.
     pub fn finish(mut self) -> io::Result<TableMeta> {
+        // The trailing block is almost always short of the target size.
+        if self.block_bytes > 0 {
+            self.close_block();
+        }
+
         let data_crc = self.hasher.clone().finalize();
         let data_len = self.data_len;
 
@@ -303,9 +411,15 @@ impl SsTableWriter {
         let bloom_off = data_len;
         let bloom_len = bloom_bytes.len() as u64;
 
-        // Index section is still reserved but empty; filled in by milestone 4.
+        let index_bytes = if self.index.is_empty() {
+            Vec::new()
+        } else {
+            encode_index(&self.index)
+        };
+        self.writer()?.write_all(&index_bytes)?;
+
         let index_off = bloom_off + bloom_len;
-        let index_len = 0u64;
+        let index_len = index_bytes.len() as u64;
 
         let meta = TableMeta {
             num_entries: self.num_entries,
@@ -351,6 +465,14 @@ impl SsTableWriter {
         Ok(TableMeta { size_bytes, ..meta })
     }
 
+    /// Finalizes the current block by recording its length.
+    fn close_block(&mut self) {
+        if let Some(last) = self.index.last_mut() {
+            last.len = self.data_len - last.offset;
+        }
+        self.block_bytes = 0;
+    }
+
     /// Borrows the open file, erroring if the writer was already finished.
     fn writer(&mut self) -> io::Result<&mut BufWriter<File>> {
         self.file
@@ -366,6 +488,11 @@ impl SsTableWriter {
     /// Number of entries appended so far.
     pub fn num_entries(&self) -> u64 {
         self.num_entries
+    }
+
+    /// Number of data blocks opened so far.
+    pub fn num_blocks(&self) -> usize {
+        self.index.len()
     }
 }
 
@@ -388,6 +515,10 @@ pub struct SsTable {
     /// filter fails its checksum. Either way the table stays fully readable —
     /// a missing filter costs a scan, never a wrong answer.
     bloom: Option<BloomFilter>,
+    /// Sparse index, one entry per data block. Empty when the table predates
+    /// the index or its section failed to parse; lookups then fall back to a
+    /// full scan.
+    index: Vec<IndexEntry>,
 }
 
 impl SsTable {
@@ -431,11 +562,26 @@ impl SsTable {
             None
         };
 
+        let index = if footer.index_len > 0 {
+            if footer.index_off + footer.index_len > file_len {
+                return Err(corrupt("index section extends past end of file"));
+            }
+            let mut index_bytes = vec![0u8; footer.index_len as usize];
+            file.seek(SeekFrom::Start(footer.index_off))?;
+            file.read_exact(&mut index_bytes)?;
+            // As with the bloom filter, a corrupt index degrades to a scan
+            // rather than failing the open.
+            decode_index(&index_bytes).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             path,
             footer,
             meta,
             bloom,
+            index,
         })
     }
 
@@ -458,11 +604,67 @@ impl SsTable {
                 return Ok(None);
             }
         }
+
+        match self.find_block(key) {
+            Some(block) => self.get_in_block(block, key),
+            // No usable index: fall back to scanning the whole data section.
+            None if self.index.is_empty() => self.get_by_scan(key),
+            // There is an index, and it says no block can hold this key.
+            None => Ok(None),
+        }
+    }
+
+    /// Returns the one block that could contain `key`, if any.
+    ///
+    /// Blocks are identified by their first key, so the candidate is the last
+    /// block whose first key is `<= key`. Anything sorting before the first
+    /// block's first key cannot be in the table at all.
+    fn find_block(&self, key: &[u8]) -> Option<&IndexEntry> {
+        if self.index.is_empty() {
+            return None;
+        }
+        match self
+            .index
+            .binary_search_by(|entry| entry.first_key.as_slice().cmp(key))
+        {
+            // Exact hit on a block's first key.
+            Ok(i) => Some(&self.index[i]),
+            // Sorts before every block.
+            Err(0) => None,
+            Err(i) => Some(&self.index[i - 1]),
+        }
+    }
+
+    /// Reads a single block and looks for `key` within it.
+    fn get_in_block(&self, block: &IndexEntry, key: &[u8]) -> io::Result<Option<Entry>> {
+        if block.offset + block.len > self.footer.data_len {
+            return Err(corrupt("index entry points past the data section"));
+        }
+
+        let mut file = File::open(&self.path)?;
+        file.seek(SeekFrom::Start(block.offset))?;
+        let mut buf = vec![0u8; block.len as usize];
+        file.read_exact(&mut buf)?;
+
+        let mut cursor = &buf[..];
+        while !cursor.is_empty() {
+            let (_, k, entry) = read_entry(&mut cursor)?;
+            match k.as_slice().cmp(key) {
+                std::cmp::Ordering::Less => continue,
+                // Blocks are sorted, so passing the target ends the search.
+                std::cmp::Ordering::Greater => return Ok(None),
+                std::cmp::Ordering::Equal => return Ok(Some(entry)),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Sequential fallback for tables with no usable index.
+    fn get_by_scan(&self, key: &[u8]) -> io::Result<Option<Entry>> {
         for item in self.iter()? {
             let (k, entry) = item?;
             match k.as_slice().cmp(key) {
                 std::cmp::Ordering::Less => continue,
-                // Keys are sorted, so passing the target means it is absent.
                 std::cmp::Ordering::Greater => return Ok(None),
                 std::cmp::Ordering::Equal => return Ok(Some(entry)),
             }
@@ -524,6 +726,21 @@ impl SsTable {
     /// Returns `true` if this table carries a usable bloom filter.
     pub fn has_bloom(&self) -> bool {
         self.bloom.is_some()
+    }
+
+    /// Borrows the sparse index, one entry per data block.
+    pub fn index(&self) -> &[IndexEntry] {
+        &self.index
+    }
+
+    /// Returns the number of data blocks, or 0 if the table has no index.
+    pub fn num_blocks(&self) -> usize {
+        self.index.len()
+    }
+
+    /// Returns `true` if this table has a usable sparse index.
+    pub fn has_index(&self) -> bool {
+        !self.index.is_empty()
     }
 
     /// Returns the table's path on disk.
@@ -1145,6 +1362,292 @@ mod bloom_integration_tests {
             bloom_bytes * 20 < meta.size_bytes,
             "filter is {bloom_bytes} bytes against a {} byte table",
             meta.size_bytes
+        );
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::tests_support::*;
+    use super::*;
+
+    /// Writes a table big enough to span several blocks.
+    fn write_multiblock(path: &Path, n: u32) {
+        let mut w = SsTableWriter::create(path).unwrap();
+        for i in 0..n {
+            let key = format!("key:{i:06}");
+            // ~100 bytes per entry, so ~40 entries per 4 KiB block.
+            w.append(key.as_bytes(), &Entry::Value(vec![b'v'; 90]))
+                .unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    #[test]
+    fn a_table_larger_than_one_block_gets_several_index_entries() {
+        let dir = TempDir::new("multiblock");
+        let path = dir.file("t.sst");
+        write_multiblock(&path, 1_000);
+
+        let table = SsTable::open(&path).unwrap();
+        assert!(table.has_index());
+        assert!(
+            table.num_blocks() > 10,
+            "expected many blocks, got {}",
+            table.num_blocks()
+        );
+        // Sparse: far fewer index entries than keys.
+        assert!(
+            (table.num_blocks() as u64) < table.len() / 5,
+            "index should be sparse: {} blocks for {} keys",
+            table.num_blocks(),
+            table.len()
+        );
+    }
+
+    #[test]
+    fn every_key_is_findable_through_the_index() {
+        let dir = TempDir::new("all-findable");
+        let path = dir.file("t.sst");
+        write_multiblock(&path, 1_000);
+
+        let table = SsTable::open(&path).unwrap();
+        for i in 0..1_000u32 {
+            let key = format!("key:{i:06}");
+            assert_eq!(
+                table.get(key.as_bytes()).unwrap(),
+                Some(Entry::Value(vec![b'v'; 90])),
+                "{key} was not reachable via the index"
+            );
+        }
+    }
+
+    #[test]
+    fn keys_between_and_outside_blocks_return_none() {
+        let dir = TempDir::new("gaps");
+        let path = dir.file("t.sst");
+
+        // Even keys only, so every odd key falls in a gap.
+        let mut w = SsTableWriter::create(&path).unwrap();
+        for i in (0..1_000u32).step_by(2) {
+            let key = format!("key:{i:06}");
+            w.append(key.as_bytes(), &Entry::Value(vec![b'x'; 90]))
+                .unwrap();
+        }
+        w.finish().unwrap();
+
+        let table = SsTable::open(&path).unwrap();
+        for i in (1..1_000u32).step_by(2) {
+            let key = format!("key:{i:06}");
+            assert_eq!(table.get(key.as_bytes()).unwrap(), None, "{key} is absent");
+        }
+        assert_eq!(
+            table.get(b"aaaaaa").unwrap(),
+            None,
+            "sorts before all blocks"
+        );
+        assert_eq!(
+            table.get(b"zzzzzz").unwrap(),
+            None,
+            "sorts after all blocks"
+        );
+    }
+
+    #[test]
+    fn block_boundaries_are_searchable() {
+        // The first and last key of every block are the cases a binary search
+        // gets wrong most easily.
+        let dir = TempDir::new("boundaries");
+        let path = dir.file("t.sst");
+        write_multiblock(&path, 500);
+
+        let table = SsTable::open(&path).unwrap();
+        for entry in table.index() {
+            let key = entry.first_key.clone();
+            assert!(
+                table.get(&key).unwrap().is_some(),
+                "block's own first key {:?} must be findable",
+                String::from_utf8_lossy(&key)
+            );
+        }
+    }
+
+    #[test]
+    fn index_entries_are_sorted_and_cover_the_data_section_exactly() {
+        let dir = TempDir::new("coverage");
+        let path = dir.file("t.sst");
+        write_multiblock(&path, 600);
+
+        let table = SsTable::open(&path).unwrap();
+        let index = table.index();
+
+        // Sorted, non-overlapping, contiguous from 0 to data_len.
+        let mut expected_offset = 0u64;
+        for (i, entry) in index.iter().enumerate() {
+            assert_eq!(entry.offset, expected_offset, "block {i} is not contiguous");
+            assert!(entry.len > 0, "block {i} is empty");
+            if i > 0 {
+                assert!(
+                    index[i - 1].first_key < entry.first_key,
+                    "block first keys must ascend"
+                );
+            }
+            expected_offset += entry.len;
+        }
+        assert_eq!(
+            expected_offset, table.footer.data_len,
+            "blocks must tile the whole data section"
+        );
+    }
+
+    #[test]
+    fn the_first_key_of_the_table_matches_the_first_index_entry() {
+        let dir = TempDir::new("first-key");
+        let path = dir.file("t.sst");
+        write_multiblock(&path, 200);
+
+        let table = SsTable::open(&path).unwrap();
+        assert_eq!(table.index()[0].first_key, table.meta().min_key);
+        assert_eq!(table.index()[0].offset, 0);
+    }
+
+    #[test]
+    fn a_small_table_still_gets_exactly_one_block() {
+        let dir = TempDir::new("one-block");
+        let path = dir.file("t.sst");
+        write_table(&path, &[("a", Some("1")), ("b", Some("2"))]);
+
+        let table = SsTable::open(&path).unwrap();
+        assert_eq!(table.num_blocks(), 1);
+        assert_eq!(table.get(b"a").unwrap(), Some(Entry::Value(b"1".to_vec())));
+        assert_eq!(table.get(b"b").unwrap(), Some(Entry::Value(b"2".to_vec())));
+    }
+
+    #[test]
+    fn an_empty_table_has_no_index() {
+        let dir = TempDir::new("no-index");
+        let path = dir.file("t.sst");
+        write_table(&path, &[]);
+
+        let table = SsTable::open(&path).unwrap();
+        assert!(!table.has_index());
+        assert_eq!(table.get(b"anything").unwrap(), None);
+    }
+
+    #[test]
+    fn tombstones_are_findable_through_the_index() {
+        let dir = TempDir::new("index-tombstone");
+        let path = dir.file("t.sst");
+
+        let mut w = SsTableWriter::create(&path).unwrap();
+        for i in 0..500u32 {
+            let key = format!("key:{i:06}");
+            let entry = if i % 3 == 0 {
+                Entry::Tombstone
+            } else {
+                Entry::Value(vec![b'v'; 90])
+            };
+            w.append(key.as_bytes(), &entry).unwrap();
+        }
+        w.finish().unwrap();
+
+        let table = SsTable::open(&path).unwrap();
+        for i in 0..500u32 {
+            let key = format!("key:{i:06}");
+            let got = table.get(key.as_bytes()).unwrap();
+            if i % 3 == 0 {
+                assert_eq!(got, Some(Entry::Tombstone), "{key}");
+            } else {
+                assert_eq!(got, Some(Entry::Value(vec![b'v'; 90])), "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_corrupt_index_degrades_to_a_scan_rather_than_a_wrong_answer() {
+        let dir = TempDir::new("corrupt-index");
+        let path = dir.file("t.sst");
+        write_multiblock(&path, 300);
+
+        let table = SsTable::open(&path).unwrap();
+        let index_off = table.footer.index_off as usize;
+        drop(table);
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[index_off + 9] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        let table = SsTable::open(&path).unwrap();
+        assert!(!table.has_index(), "corrupt index must be discarded");
+
+        // Reads still correct, just via the fallback scan.
+        for i in [0u32, 42, 299] {
+            let key = format!("key:{i:06}");
+            assert_eq!(
+                table.get(key.as_bytes()).unwrap(),
+                Some(Entry::Value(vec![b'v'; 90])),
+                "{key}"
+            );
+        }
+        assert_eq!(table.get(b"key:000300").unwrap(), None);
+    }
+
+    #[test]
+    fn the_index_round_trips_through_its_encoding() {
+        let entries = vec![
+            IndexEntry {
+                first_key: b"alpha".to_vec(),
+                offset: 0,
+                len: 4096,
+            },
+            IndexEntry {
+                first_key: vec![0x00, 0xff],
+                offset: 4096,
+                len: 512,
+            },
+        ];
+        let decoded = decode_index(&encode_index(&entries)).expect("should decode");
+        assert_eq!(decoded, entries);
+    }
+
+    #[test]
+    fn a_corrupt_or_truncated_index_encoding_is_rejected() {
+        let entries = vec![IndexEntry {
+            first_key: b"k".to_vec(),
+            offset: 0,
+            len: 10,
+        }];
+        let encoded = encode_index(&entries);
+
+        let mut corrupt = encoded.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+        assert!(decode_index(&corrupt).is_none());
+
+        assert!(decode_index(&encoded[..encoded.len() - 4]).is_none());
+        assert!(decode_index(&[]).is_none());
+    }
+
+    #[test]
+    fn a_lookup_reads_far_less_than_the_whole_table() {
+        // The point of the index: a point lookup touches one block, not the file.
+        let dir = TempDir::new("io-bound");
+        let path = dir.file("t.sst");
+        write_multiblock(&path, 2_000);
+
+        let table = SsTable::open(&path).unwrap();
+        let block = table.find_block(b"key:001000").expect("a candidate block");
+
+        assert!(
+            block.len <= (BLOCK_TARGET_BYTES as u64) * 2,
+            "one block is {} bytes",
+            block.len
+        );
+        assert!(
+            block.len * 10 < table.footer.data_len,
+            "block {} vs data section {}",
+            block.len,
+            table.footer.data_len
         );
     }
 }

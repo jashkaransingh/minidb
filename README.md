@@ -36,7 +36,7 @@ This is a work in progress, and the split is sharp:
 | `wal` | **Working** | crc32-checksummed append-only log, fsync-per-write, crash recovery with torn-tail truncation |
 | `lib` (`Db` API) | **Working** | In-memory or durable; writes logged + fsynced, memtable flushed to SSTables, reads merged newest-first |
 | `main` (CLI demo) | **Working** | `cargo run` exercises both the in-memory and the write-drop-reopen paths |
-| `sstable` | **Working** | Immutable sorted tables: crc32-checked sections, footer with magic/version, atomic publish via rename |
+| `sstable` | **Working** | Immutable sorted tables, 4 KiB blocks, sparse index, crc32-checked sections, atomic publish |
 | `bloom` | **Working** | Sized from the textbook formula, double hashing, crc32-checked, one per table |
 | `compaction` | Scaffolded | Signatures + leveled strategy documented; bodies are `todo!()` |
 
@@ -45,22 +45,23 @@ mutation, fsyncs before acknowledging it, and flushes the memtable to an immutab
 passes its size threshold. Reads search the memtable and then each table newest-first, stopping at
 the first value or tombstone. Acknowledged writes survive a crash.
 
-Each table carries a bloom filter, so a **miss** is now resolved from memory: a key-range check and
-an in-memory bit probe, with no disk read at all. Measured on 2 000 keys, the filter rejects >90% of
-absent keys outright.
+Point lookups are now properly indexed. A read filters through four stages, cheapest first: key
+range → bloom filter → binary search over the sparse index → scan one 4 KiB block. A **miss** is
+usually resolved entirely in memory (the filter rejects >90% of absent keys), and a **hit** costs a
+single block read rather than a scan of the whole table.
 
-The honest gap: a **hit** still costs a sequential scan of the table's data section, because the
-sparse index section is reserved but empty. Lookups of keys that *are* present are therefore O(n) per
-table — milestone 4. Tables also accumulate without bound; nothing merges them yet, so read
-amplification grows with the number of flushes. `compaction` is still `todo!()` and will panic if
-called.
+The honest gap: **tables accumulate without bound.** Nothing merges them, so every flush adds another
+table that reads may have to consult, and superseded values and tombstones are never reclaimed. That
+is compaction — the next milestone — and `compaction.rs` is still `todo!()` and will panic if called.
+There is also no concurrency: `Db` needs `&mut self` to write, and there is no locking for shared
+access.
 
-111 tests currently pass (`cargo test`).
+124 tests currently pass (`cargo test`).
 
 ## Architecture
 
-The intended full design. The WAL, memtable, L0 SSTable, and bloom filter boxes are implemented
-today; the sparse index and everything at L1 and below are not yet.
+The intended full design. The WAL, memtable, L0 SSTable, bloom filter, and sparse index are
+implemented today; everything at L1 and below — that is, compaction — is not yet.
 
 ```
                  WRITE PATH                              READ PATH
@@ -112,11 +113,11 @@ bottom-most level and can safely drop both.
 
 ```
 ┌──────────────────────────────────────────────┐
-│ Data section      entries, ascending keys     │  implemented
+│ Data blocks       ~4 KiB, ascending keys      │  implemented
 ├──────────────────────────────────────────────┤
 │ Bloom filter      "definitely not here?"      │  implemented
 ├──────────────────────────────────────────────┤
-│ Sparse index      first key → block offset    │  reserved, empty
+│ Sparse index      first key → block offset    │  implemented
 ├──────────────────────────────────────────────┤
 │ Meta              counts, min/max key         │  implemented
 ├──────────────────────────────────────────────┤
@@ -142,7 +143,7 @@ immutable, this is a k-way sequential merge — cheap, restartable, and safe to 
 ```bash
 cargo build     # compile
 cargo run       # demo: in-memory ops, then write / drop / reopen recovery
-cargo test      # 111 tests, unit + integration + doctest
+cargo test      # 124 tests, unit + integration + doctest
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -199,7 +200,7 @@ assert_eq!(recovered.get(b"key"), Some(b"value".to_vec()));
 - [x] **SSTable flush** — immutable sorted tables, checksummed sections, atomic publish by rename,
       WAL rotated only once the table is durable
 - [x] **Bloom filters** — one per table, Kirsch–Mitzenmacher double hashing, so misses skip the read
-- [ ] **Sparse block index** — binary search to a single block instead of scanning the table
+- [x] **Sparse block index** — binary search to a single block instead of scanning the table
 - [ ] **Compaction** — leveled strategy, k-way merge, correct tombstone lifetime
 - [ ] **Concurrent readers/writers** — lock-free reads against immutable tables, single writer
 - [ ] **MVCC / snapshot isolation** — sequence-numbered keys, point-in-time consistent reads
