@@ -56,6 +56,7 @@
 
 pub mod bloom;
 pub mod compaction;
+pub mod fault;
 pub mod memtable;
 pub mod sstable;
 pub mod wal;
@@ -67,6 +68,7 @@ use std::path::{Path, PathBuf};
 use compaction::{Marker, merge_into, plan};
 
 pub use compaction::{COMPACTION_MARKER, CompactionConfig, CompactionTask, TableInfo};
+pub use fault::FaultPlan;
 pub use memtable::{Entry, MemTable};
 pub use sstable::{SsTable, SsTableWriter, TableMeta};
 pub use wal::{Record, Recovery, SyncPolicy, Wal};
@@ -91,6 +93,8 @@ pub struct DbOptions {
     pub compaction: CompactionConfig,
     /// Whether a flush automatically triggers any compaction it makes due.
     pub auto_compact: bool,
+    /// Scripted failure point, for crash testing. See [`fault`].
+    pub fault: FaultPlan,
 }
 
 impl Default for DbOptions {
@@ -100,6 +104,7 @@ impl Default for DbOptions {
             flush_threshold_bytes: MEMTABLE_FLUSH_THRESHOLD_BYTES,
             compaction: CompactionConfig::default(),
             auto_compact: true,
+            fault: FaultPlan::none(),
         }
     }
 }
@@ -193,7 +198,8 @@ impl Db {
             }
         }
 
-        let wal = Wal::open(&wal_path, options.sync_policy)?;
+        let mut wal = Wal::open(&wal_path, options.sync_policy)?;
+        wal.set_fault_plan(options.fault);
 
         Ok(Self {
             memtable,

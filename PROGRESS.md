@@ -440,3 +440,83 @@ iterations, producing a table with duplicate keys — which `SsTableWriter` woul
 Milestone 6 — in-process fault-injection crash testing: a deterministic, seeded failure point
 injected into the write path, asserting across ≥100 randomized runs that every write acknowledged
 before the simulated crash is still readable afterwards.
+
+---
+
+## Milestone 6 — Fault-injection crash testing
+
+**Status:** complete. Build, test, clippy (`-D warnings`), and fmt all clean. 159 tests pass.
+
+### What was built
+
+`src/fault.rs` (new) plus a hook in the WAL write path, and `tests/crash_test.rs`.
+
+- **`FaultPlan`** — names a byte offset at which a simulated crash fires. Offsets count *total bytes
+  appended over the log's lifetime*, so a plan stays meaningful across the rotations that happen when
+  the memtable is flushed.
+- **`Wal::write_record`** — when the offset falls inside a record, writes only the bytes below it,
+  flushes them to the OS, and returns an error **without fsyncing**. Every later append, sync, and
+  rotate then fails, standing in for a process that is gone.
+- **`is_simulated_crash`** — lets the harness distinguish the injected fault from a real I/O error,
+  so a broken test environment cannot masquerade as a passing crash test.
+- `DbOptions::fault` threads a plan through to the log.
+
+### Key design decisions, and why
+
+**In-process, not `kill -9`.** The task called for this, and it is also the better test. A signal
+lands wherever it lands: runs are not reproducible, a failure cannot be replayed under a debugger,
+and the harness would have to marshal "what was acknowledged" across a process boundary. Injecting
+inside the write path costs a little fidelity — it does not model sector reordering or a lying fsync
+— and buys exact determinism. That trade is documented at the top of `fault.rs`.
+
+**The crash truncates a record mid-write and skips the fsync.** Failing cleanly *between* records
+would only exercise the easy case. The interesting failure is a torn tail: bytes on disk that decode
+as a plausible header but were never acknowledged. That is precisely what the WAL's replay-and-
+truncate logic exists for, so that is what the fault produces.
+
+**The oracle is the set of acknowledged mutations, and nothing more.** A call that returned `Err` is
+the one the crash interrupted; the harness asserts *nothing* about it, because either outcome is
+correct. Asserting it was lost would be as wrong as asserting it survived. Only `Ok` returns carry
+the durability claim.
+
+**The RNG is written out in the test file rather than pulled from a crate.** A seeded xorshift64*, so
+the workload for a given seed is fixed by this file. Depending on `rand` would let a dependency
+update silently change what is being tested while the seeds stayed the same.
+
+**The harness asserts on itself.** A crash test that never crashes passes trivially. So the suite
+also checks that the fault actually fired in >80% of runs and that >1 000 mutations were acknowledged
+in total — if a refactor stopped the injection working, that shows up as a failure rather than a
+green run.
+
+### What is tested
+
+3 unit tests in `fault.rs` and 6 integration tests in `tests/crash_test.rs`:
+
+- **150 seeded randomized runs.** Each generates a 200-op workload (writes, overwrites concentrated
+  on 40 hot keys, deletes, flushes), crashes at a pseudo-random offset in the first ~6 KB, reopens,
+  and verifies every acknowledged write is present with the right value and every acknowledged delete
+  is still absent. Flush threshold is 2 KB with auto-compaction on, so runs exercise the WAL, table
+  flush, and compaction together.
+- **Usability after recovery** (30 runs): reopen, write more, reopen again — recovery must leave a
+  store that still works, not merely one that reads.
+- **Torn record in isolation**: the acknowledged write survives; the half-written one is not applied.
+- **Everything fails after the crash fires** — including `sync` — so nothing silently keeps working
+  and appears durable.
+- **An unarmed plan changes nothing** (200 writes, all recovered).
+- **Reproducibility**: the same seed yields the same workload and the same recovered state.
+
+Runtime is ~63s for the crash suite, dominated by fsync-per-write across ~150 store lifecycles.
+
+### Known limitations (deliberate)
+
+- The fault point is the **WAL write path only**. Crashes during an SSTable write and during a
+  compaction swap are covered by targeted tests (stale `.tmp` cleanup, and both marker-recovery
+  branches) rather than by the randomized harness.
+- Does not model a disk that reorders or drops sectors, or a filesystem that lies about fsync.
+- `SyncPolicy::OsBuffered` is not crash-tested, because it makes no durability promise to test.
+
+### Next
+
+All six milestones are complete. Remaining roadmap work, in order: concurrent readers/writers
+(`RwLock`-based), MVCC/snapshot isolation, a streaming range-scan iterator, a TCP wire protocol, and
+benchmarks against sled/RocksDB.

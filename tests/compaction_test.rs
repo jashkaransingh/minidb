@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use minidb::compaction::{CompactionTask, Marker, TableInfo, plan};
-use minidb::{COMPACTION_MARKER, CompactionConfig, Db, DbOptions, SyncPolicy};
+use minidb::{COMPACTION_MARKER, CompactionConfig, Db, DbOptions, FaultPlan, SyncPolicy};
 
 struct TempStore(PathBuf);
 
@@ -45,6 +45,7 @@ impl TempStore {
                 flush_threshold_bytes: usize::MAX, // flush only when asked
                 compaction,
                 auto_compact,
+                fault: FaultPlan::none(),
             },
         )
         .unwrap()

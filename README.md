@@ -39,6 +39,7 @@ This is a work in progress, and the split is sharp:
 | `sstable` | **Working** | Immutable sorted tables, 4 KiB blocks, sparse index, crc32-checked sections, atomic publish |
 | `bloom` | **Working** | Sized from the textbook formula, double hashing, crc32-checked, one per table |
 | `compaction` | **Working** | Size-tiered merging, correct tombstone lifetime, journalled crash-safe table swap |
+| `fault` | **Working** | Deterministic in-process crash injection, used by the randomized crash suite |
 
 **Durable and on disk, but not yet fast on misses.** A store opened with `Db::open` logs every
 mutation, fsyncs before acknowledging it, and flushes the memtable to an immutable SSTable once it
@@ -56,7 +57,9 @@ merge stalls writes rather than proceeding in the background. There is **no MVCC
 isolation**, and **no range-scan iterator** — `scan()` materializes the whole live dataset in memory
 and is a test helper, not a query path.
 
-150 tests currently pass (`cargo test`).
+159 tests currently pass (`cargo test`), including a randomized crash suite that injects a
+deterministic failure partway through a log record across 150 seeded runs and verifies that every
+acknowledged write survives.
 
 ## Architecture
 
@@ -154,7 +157,7 @@ does not.
 ```bash
 cargo build     # compile
 cargo run       # demo: in-memory ops, then write / drop / reopen recovery
-cargo test      # 150 tests, unit + integration + doctest
+cargo test      # 159 tests (the crash suite takes ~60s)
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -213,6 +216,7 @@ assert_eq!(recovered.get(b"key"), Some(b"value".to_vec()));
 - [x] **Bloom filters** — one per table, Kirsch–Mitzenmacher double hashing, so misses skip the read
 - [x] **Sparse block index** — binary search to a single block instead of scanning the table
 - [x] **Compaction** — size-tiered merging, k-way merge, correct tombstone lifetime, journalled swap
+- [x] **Crash testing** — deterministic in-process fault injection, 150 seeded randomized runs
 - [ ] **Concurrent readers/writers** — lock-free reads against immutable tables, single writer
 - [ ] **MVCC / snapshot isolation** — sequence-numbered keys, point-in-time consistent reads
 - [ ] **Range-scan iterator** — merged ordered iteration across memtable and all levels

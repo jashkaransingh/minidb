@@ -47,6 +47,8 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::{fmt, io};
 
+use crate::fault::{FaultPlan, simulated_crash};
+
 /// Bytes of fixed header preceding each record's payload.
 const HEADER_LEN: usize = 4 + 1 + 4 + 4;
 
@@ -148,6 +150,12 @@ pub struct Wal {
     path: PathBuf,
     policy: SyncPolicy,
     size_bytes: u64,
+    /// Bytes appended over this log's lifetime, unaffected by rotation. Fault
+    /// plans are expressed against this, so a plan survives a memtable flush.
+    total_appended: u64,
+    fault: FaultPlan,
+    /// Set once an injected fault has fired; every later operation fails.
+    crashed: bool,
 }
 
 impl Wal {
@@ -176,6 +184,9 @@ impl Wal {
             path,
             policy,
             size_bytes,
+            total_appended: 0,
+            fault: FaultPlan::none(),
+            crashed: false,
         })
     }
 
@@ -185,27 +196,64 @@ impl Wal {
     /// be recovered by [`replay`](Self::replay) even if the process dies in the
     /// next instant.
     pub fn append(&mut self, record: &Record) -> io::Result<()> {
-        let bytes = record.encode();
-        self.file.write_all(&bytes)?;
-        self.size_bytes += bytes.len() as u64;
-
+        self.write_record(&record.encode())?;
         if self.policy == SyncPolicy::EveryWrite {
             self.sync()?;
         }
         Ok(())
     }
 
+    /// Writes one encoded record, honouring any armed fault plan.
+    fn write_record(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.crashed {
+            return Err(simulated_crash());
+        }
+
+        if let Some(limit) = self.fault.crash_after_wal_bytes
+            && self.total_appended + bytes.len() as u64 > limit
+        {
+            // Write only what fits below the fault point and flush it to the OS,
+            // then fail *without* fsyncing — exactly the torn, unacknowledged
+            // tail a crash mid-append leaves behind.
+            let partial = limit.saturating_sub(self.total_appended) as usize;
+            self.file.write_all(&bytes[..partial])?;
+            self.file.flush()?;
+            self.size_bytes += partial as u64;
+            self.total_appended += partial as u64;
+            self.crashed = true;
+            return Err(simulated_crash());
+        }
+
+        self.file.write_all(bytes)?;
+        self.size_bytes += bytes.len() as u64;
+        self.total_appended += bytes.len() as u64;
+        Ok(())
+    }
+
     /// Appends several records, paying at most one fsync for the batch.
     pub fn append_batch(&mut self, records: &[Record]) -> io::Result<()> {
         for record in records {
-            let bytes = record.encode();
-            self.file.write_all(&bytes)?;
-            self.size_bytes += bytes.len() as u64;
+            self.write_record(&record.encode())?;
         }
         if self.policy == SyncPolicy::EveryWrite {
             self.sync()?;
         }
         Ok(())
+    }
+
+    /// Arms a fault plan on this log. See [`crate::fault`].
+    pub fn set_fault_plan(&mut self, plan: FaultPlan) {
+        self.fault = plan;
+    }
+
+    /// Returns `true` once an injected fault has fired.
+    pub fn has_crashed(&self) -> bool {
+        self.crashed
+    }
+
+    /// Returns the number of bytes appended over this log's lifetime.
+    pub fn total_appended(&self) -> u64 {
+        self.total_appended
     }
 
     /// Replays every intact record in the log, in write order.
@@ -240,6 +288,9 @@ impl Wal {
 
     /// Forces buffered data to stable storage.
     pub fn sync(&mut self) -> io::Result<()> {
+        if self.crashed {
+            return Err(simulated_crash());
+        }
         self.file.flush()?;
         self.file.get_ref().sync_data()
     }
@@ -251,6 +302,9 @@ impl Wal {
     /// required order is: write the SSTable, fsync it, fsync its directory,
     /// *then* call this.
     pub fn rotate(&mut self) -> io::Result<()> {
+        if self.crashed {
+            return Err(simulated_crash());
+        }
         self.file.flush()?;
         let file = OpenOptions::new().write(true).open(&self.path)?;
         file.set_len(0)?;

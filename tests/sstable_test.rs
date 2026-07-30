@@ -7,7 +7,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use minidb::{CompactionConfig, Db, DbOptions, Entry, SsTable, SsTableWriter, SyncPolicy};
+use minidb::{
+    CompactionConfig, Db, DbOptions, Entry, FaultPlan, SsTable, SsTableWriter, SyncPolicy,
+};
 
 /// A scratch store directory that removes itself on drop.
 struct TempStore(PathBuf);
@@ -33,6 +35,7 @@ impl TempStore {
                 // These tests exercise flush and shadowing in isolation;
                 // compaction has its own suite.
                 auto_compact: false,
+                fault: FaultPlan::none(),
             },
         )
         .unwrap()
