@@ -2,10 +2,11 @@
 //!
 //! # Status
 //!
-//! The in-memory write path is real and tested. Durability and the on-disk
-//! levels are scaffolded with documented signatures but not yet implemented —
-//! see the module docs for [`wal`], [`sstable`], [`bloom`], and [`compaction`].
-//! **Nothing written through this API currently survives process exit.**
+//! The write path is durable: mutations are appended to a write-ahead log and
+//! fsynced before they are acknowledged, and a store reopened after a crash
+//! replays that log to rebuild its in-memory state. The on-disk levels —
+//! SSTables, bloom filters, and compaction — are still scaffolded; see the
+//! module docs for [`sstable`], [`bloom`], and [`compaction`].
 //!
 //! # Design
 //!
@@ -15,15 +16,37 @@
 //! across the memtable and then each on-disk level, which is why bloom filters
 //! and a sparse per-table index matter so much once the disk levels exist.
 //!
+//! # Examples
+//!
+//! In memory, with no durability:
+//!
 //! ```
 //! use minidb::Db;
 //!
 //! let mut db = Db::new();
-//! db.put(b"lang", b"rust");
+//! db.put(b"lang", b"rust").unwrap();
 //! assert_eq!(db.get(b"lang"), Some(b"rust".to_vec()));
 //!
-//! db.delete(b"lang");
+//! db.delete(b"lang").unwrap();
 //! assert_eq!(db.get(b"lang"), None);
+//! ```
+//!
+//! Durable, backed by a directory on disk:
+//!
+//! ```
+//! # use std::fs;
+//! use minidb::Db;
+//!
+//! # let dir = std::env::temp_dir().join("minidb-doctest-open");
+//! # let _ = fs::remove_dir_all(&dir);
+//! let mut db = Db::open(&dir)?;
+//! db.put(b"key", b"value")?;
+//! drop(db); // or crash here — the write is already fsynced
+//!
+//! let recovered = Db::open(&dir)?;
+//! assert_eq!(recovered.get(b"key"), Some(b"value".to_vec()));
+//! # let _ = fs::remove_dir_all(&dir);
+//! # Ok::<(), std::io::Error>(())
 //! ```
 
 pub mod bloom;
@@ -32,47 +55,108 @@ pub mod memtable;
 pub mod sstable;
 pub mod wal;
 
-pub use memtable::{Entry, MemTable};
+use std::io;
+use std::path::{Path, PathBuf};
 
-/// Size at which a memtable would be frozen and flushed to an SSTable.
+pub use memtable::{Entry, MemTable};
+pub use wal::{Record, Recovery, SyncPolicy, Wal};
+
+/// Size at which a memtable is frozen and flushed to an SSTable.
 ///
-/// Unused until the flush path exists; recorded here so the threshold lives with
-/// the rest of the store configuration.
+/// Not yet enforced — the flush path lands with the SSTable milestone.
 pub const MEMTABLE_FLUSH_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+
+/// Filename of the write-ahead log within a store directory.
+pub const WAL_FILENAME: &str = "wal.log";
 
 /// The store's public handle.
 ///
-/// Today this is a thin wrapper over a single [`MemTable`]. As the on-disk
-/// levels land it grows a WAL, a frozen-memtable queue, and a level manifest —
-/// the API surface here is meant to stay put while that happens underneath.
+/// A `Db` is either **in-memory** ([`Db::new`]) or **durable** ([`Db::open`]).
+/// The durable form appends every mutation to a write-ahead log before applying
+/// it to the memtable, so an acknowledged write survives a crash.
 #[derive(Debug, Default)]
 pub struct Db {
     memtable: MemTable,
+    wal: Option<Wal>,
+    dir: Option<PathBuf>,
 }
 
 impl Db {
-    /// Opens an in-memory store.
+    /// Opens a purely in-memory store.
     ///
-    /// There is no `open(path)` yet — that arrives with the WAL, since opening a
-    /// store means replaying one.
+    /// Nothing is written to disk and nothing survives process exit. Useful for
+    /// tests and for callers that want the data structure without the I/O.
     pub fn new() -> Self {
         Self {
             memtable: MemTable::new(),
+            wal: None,
+            dir: None,
         }
+    }
+
+    /// Opens a durable store in `dir`, creating the directory if needed.
+    ///
+    /// Any existing write-ahead log is replayed to rebuild the memtable. If the
+    /// log has a damaged tail — the normal result of a crash mid-append — the
+    /// damaged records are discarded and the log is truncated to its last
+    /// intact record. Everything acknowledged before the crash is recovered.
+    pub fn open<P: AsRef<Path>>(dir: P) -> io::Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)?;
+
+        let wal_path = dir.join(WAL_FILENAME);
+        let recovery = Wal::replay(&wal_path)?;
+
+        let mut memtable = MemTable::new();
+        for record in &recovery.records {
+            match record {
+                Record::Put { key, value } => memtable.put(key.clone(), value.clone()),
+                Record::Delete { key } => {
+                    memtable.delete(key.clone());
+                }
+            }
+        }
+
+        let wal = Wal::open(&wal_path, SyncPolicy::EveryWrite)?;
+
+        Ok(Self {
+            memtable,
+            wal: Some(wal),
+            dir: Some(dir),
+        })
+    }
+
+    /// Opens a durable store with an explicit fsync policy.
+    ///
+    /// [`SyncPolicy::OsBuffered`] trades crash-durability for throughput: writes
+    /// are logged but not fsynced, so a power failure can lose recent
+    /// acknowledged writes. Process-level crashes are still survived, since the
+    /// bytes reach the OS.
+    pub fn open_with_policy<P: AsRef<Path>>(dir: P, policy: SyncPolicy) -> io::Result<Self> {
+        let mut db = Self::open(dir)?;
+        if let Some(path) = db.wal.as_ref().map(|w| w.path().to_path_buf()) {
+            db.wal = Some(Wal::open(path, policy)?);
+        }
+        Ok(db)
     }
 
     /// Writes `value` at `key`, replacing any existing value.
     ///
-    /// Not durable: once the WAL exists this will append and fsync before
-    /// returning, and the signature will become fallible.
-    pub fn put(&mut self, key: &[u8], value: &[u8]) {
+    /// On a durable store this returns only after the mutation is in the log
+    /// (and fsynced, under the default policy). If it returns `Ok`, the write
+    /// will survive a crash.
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
+        if let Some(wal) = self.wal.as_mut() {
+            wal.append(&Record::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            })?;
+        }
         self.memtable.put(key.to_vec(), value.to_vec());
+        Ok(())
     }
 
     /// Reads the value at `key`, or `None` if absent or deleted.
-    ///
-    /// Once SSTables exist this searches newest-to-oldest and stops at the first
-    /// table holding either a value or a tombstone for the key.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.memtable.get(key).map(|v| v.to_vec())
     }
@@ -80,8 +164,22 @@ impl Db {
     /// Deletes `key`, returning `true` if a live value was removed.
     ///
     /// Recorded as a tombstone rather than an erasure — see [`Entry`].
-    pub fn delete(&mut self, key: &[u8]) -> bool {
-        self.memtable.delete(key.to_vec())
+    pub fn delete(&mut self, key: &[u8]) -> io::Result<bool> {
+        if let Some(wal) = self.wal.as_mut() {
+            wal.append(&Record::Delete { key: key.to_vec() })?;
+        }
+        Ok(self.memtable.delete(key.to_vec()))
+    }
+
+    /// Forces any buffered log data to stable storage.
+    ///
+    /// A no-op under the default [`SyncPolicy::EveryWrite`], which has already
+    /// synced. Meaningful under [`SyncPolicy::OsBuffered`].
+    pub fn sync(&mut self) -> io::Result<()> {
+        match self.wal.as_mut() {
+            Some(wal) => wal.sync(),
+            None => Ok(()),
+        }
     }
 
     /// Returns `true` if `key` currently resolves to a value.
@@ -104,6 +202,21 @@ impl Db {
         self.memtable.size_bytes()
     }
 
+    /// Returns `true` if this store is backed by a write-ahead log.
+    pub fn is_durable(&self) -> bool {
+        self.wal.is_some()
+    }
+
+    /// Returns the store's directory, or `None` for an in-memory store.
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
+
+    /// Returns the size of the write-ahead log in bytes, or 0 if in-memory.
+    pub fn wal_size_bytes(&self) -> u64 {
+        self.wal.as_ref().map_or(0, |w| w.size_bytes())
+    }
+
     /// Borrows the underlying memtable.
     pub fn memtable(&self) -> &MemTable {
         &self.memtable
@@ -119,12 +232,12 @@ mod tests {
         let mut db = Db::new();
         assert!(db.is_empty());
 
-        db.put(b"k", b"v");
+        db.put(b"k", b"v").unwrap();
         assert_eq!(db.get(b"k"), Some(b"v".to_vec()));
         assert!(db.contains(b"k"));
         assert_eq!(db.len(), 1);
 
-        assert!(db.delete(b"k"));
+        assert!(db.delete(b"k").unwrap());
         assert_eq!(db.get(b"k"), None);
         assert!(!db.contains(b"k"));
         assert!(db.is_empty());
@@ -133,6 +246,14 @@ mod tests {
     #[test]
     fn deleting_an_absent_key_is_a_no_op_for_callers() {
         let mut db = Db::new();
-        assert!(!db.delete(b"nope"));
+        assert!(!db.delete(b"nope").unwrap());
+    }
+
+    #[test]
+    fn an_in_memory_store_writes_no_log() {
+        let db = Db::new();
+        assert!(!db.is_durable());
+        assert_eq!(db.wal_size_bytes(), 0);
+        assert!(db.dir().is_none());
     }
 }

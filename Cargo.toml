@@ -10,3 +10,4 @@ keywords = ["database", "lsm-tree", "key-value", "storage-engine", "embedded"]
 categories = ["database-implementations", "data-structures"]
 
 [dependencies]
+crc32fast = "1.5.0"

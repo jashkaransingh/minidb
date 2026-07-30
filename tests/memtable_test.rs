@@ -8,8 +8,8 @@ use minidb::{Db, Entry, MemTable};
 #[test]
 fn writes_are_visible_to_subsequent_reads() {
     let mut db = Db::new();
-    db.put(b"user:1", b"ada");
-    db.put(b"user:2", b"grace");
+    db.put(b"user:1", b"ada").unwrap();
+    db.put(b"user:2", b"grace").unwrap();
 
     assert_eq!(db.get(b"user:1"), Some(b"ada".to_vec()));
     assert_eq!(db.get(b"user:2"), Some(b"grace".to_vec()));
@@ -21,7 +21,7 @@ fn writes_are_visible_to_subsequent_reads() {
 fn last_write_wins_for_a_repeated_key() {
     let mut db = Db::new();
     for value in ["v1", "v2", "v3"] {
-        db.put(b"key", value.as_bytes());
+        db.put(b"key", value.as_bytes()).unwrap();
     }
     assert_eq!(db.get(b"key"), Some(b"v3".to_vec()));
     assert_eq!(db.len(), 1);
@@ -30,9 +30,9 @@ fn last_write_wins_for_a_repeated_key() {
 #[test]
 fn delete_removes_a_key_from_reads() {
     let mut db = Db::new();
-    db.put(b"doomed", b"value");
+    db.put(b"doomed", b"value").unwrap();
 
-    assert!(db.delete(b"doomed"));
+    assert!(db.delete(b"doomed").unwrap());
     assert_eq!(db.get(b"doomed"), None);
     assert!(!db.contains(b"doomed"));
     assert!(db.is_empty());
@@ -41,16 +41,16 @@ fn delete_removes_a_key_from_reads() {
 #[test]
 fn delete_of_an_absent_key_reports_false() {
     let mut db = Db::new();
-    assert!(!db.delete(b"never-existed"));
+    assert!(!db.delete(b"never-existed").unwrap());
     assert!(db.is_empty());
 }
 
 #[test]
 fn a_key_can_be_rewritten_after_deletion() {
     let mut db = Db::new();
-    db.put(b"phoenix", b"first");
-    db.delete(b"phoenix");
-    db.put(b"phoenix", b"second");
+    db.put(b"phoenix", b"first").unwrap();
+    db.delete(b"phoenix").unwrap();
+    db.put(b"phoenix", b"second").unwrap();
 
     assert_eq!(db.get(b"phoenix"), Some(b"second".to_vec()));
     assert_eq!(db.len(), 1);
@@ -73,7 +73,7 @@ fn deletes_leave_tombstones_rather_than_erasing_keys() {
 fn entries_iterate_in_sorted_key_order() {
     let mut db = Db::new();
     for key in ["zeta", "alpha", "mike", "bravo"] {
-        db.put(key.as_bytes(), b"x");
+        db.put(key.as_bytes(), b"x").unwrap();
     }
 
     let keys: Vec<String> = db
@@ -91,7 +91,7 @@ fn arbitrary_binary_keys_and_values_round_trip() {
     let key = vec![0x00, 0x01, 0xfe, 0xff];
     let value = vec![0xde, 0xad, 0xbe, 0xef, 0x00];
 
-    db.put(&key, &value);
+    db.put(&key, &value).unwrap();
     assert_eq!(db.get(&key), Some(value));
 }
 
@@ -99,7 +99,8 @@ fn arbitrary_binary_keys_and_values_round_trip() {
 fn many_keys_are_all_retrievable() {
     let mut db = Db::new();
     for i in 0..1_000u32 {
-        db.put(format!("key:{i:04}").as_bytes(), i.to_be_bytes().as_slice());
+        db.put(format!("key:{i:04}").as_bytes(), i.to_be_bytes().as_slice())
+            .unwrap();
     }
 
     assert_eq!(db.len(), 1_000);
@@ -113,9 +114,9 @@ fn buffered_size_grows_with_writes_and_shrinks_on_delete() {
     let mut db = Db::new();
     assert_eq!(db.size_bytes(), 0);
 
-    db.put(b"abc", b"12345"); // 3 + 5
+    db.put(b"abc", b"12345").unwrap(); // 3 + 5
     assert_eq!(db.size_bytes(), 8);
 
-    db.delete(b"abc"); // key retained, value dropped
+    db.delete(b"abc").unwrap(); // key retained, value dropped
     assert_eq!(db.size_bytes(), 3);
 }

@@ -31,18 +31,21 @@ This is a work in progress, and the split is sharp:
 | Component | State | Notes |
 |---|---|---|
 | `memtable` | **Working** | `BTreeMap`-backed `put`/`get`/`delete`, tombstones, sorted iteration, size accounting |
-| `lib` (`Db` API) | **Working** | Public `put`/`get`/`delete`/`contains`/`len` surface over the memtable |
-| `main` (CLI demo) | **Working** | `cargo run` exercises the write path end to end |
-| `wal` | Scaffolded | Signatures + record format documented; bodies are `todo!()` |
+| `wal` | **Working** | crc32-checksummed append-only log, fsync-per-write, crash recovery with torn-tail truncation |
+| `lib` (`Db` API) | **Working** | In-memory (`Db::new`) or durable (`Db::open`); writes logged and fsynced before acknowledgement |
+| `main` (CLI demo) | **Working** | `cargo run` exercises both the in-memory and the write-drop-reopen paths |
 | `sstable` | Scaffolded | Signatures + file layout documented; bodies are `todo!()` |
 | `bloom` | Scaffolded | Signatures + sizing math documented; bodies are `todo!()` |
 | `compaction` | Scaffolded | Signatures + leveled strategy documented; bodies are `todo!()` |
 
-**Nothing is persisted yet.** The store is in-memory only, and data does not survive process exit.
-The scaffolded modules compile and document their intended design, but their functions will panic if
-called. Durability is the next milestone.
+**Durable, but not yet on-disk-resident.** A store opened with `Db::open` logs every mutation and
+fsyncs before acknowledging it, so acknowledged writes survive a crash and are replayed on reopen.
+What does *not* exist yet is the flush to SSTables — the entire dataset still lives in the memtable
+and is rebuilt from the log at startup, so memory use grows with the data and the log is never
+rotated. The `sstable`, `bloom`, and `compaction` modules compile and document their intended design,
+but their functions are `todo!()` and will panic if called.
 
-24 tests currently pass (`cargo test`).
+53 tests currently pass (`cargo test`).
 
 ## Architecture
 
@@ -143,21 +146,37 @@ cargo clippy --all-targets -- -D warnings
 
 ## Usage
 
+In-memory, with no durability:
+
 ```rust
 use minidb::Db;
 
 let mut db = Db::new();
-db.put(b"lang", b"rust");
+db.put(b"lang", b"rust")?;
 assert_eq!(db.get(b"lang"), Some(b"rust".to_vec()));
 
-db.delete(b"lang");
+db.delete(b"lang")?;
 assert_eq!(db.get(b"lang"), None);
+```
+
+Durable, backed by a directory. `put` returns only once the mutation is fsynced to the log, so an
+`Ok` return means the write survives a crash:
+
+```rust
+use minidb::Db;
+
+let mut db = Db::open("/tmp/my-store")?;
+db.put(b"key", b"value")?;
+drop(db); // or crash here — the write is already durable
+
+let recovered = Db::open("/tmp/my-store")?;
+assert_eq!(recovered.get(b"key"), Some(b"value".to_vec()));
 ```
 
 ## Roadmap
 
 - [x] **Memtable** — sorted in-memory buffer with tombstones
-- [ ] **Durability (WAL)** — checksummed append-only log, fsync policy, crash-recovery replay with
+- [x] **Durability (WAL)** — checksummed append-only log, fsync policy, crash-recovery replay with
       truncation at the first torn record
 - [ ] **SSTables + bloom filters** — block-based immutable tables, sparse index, footer;
       Kirsch–Mitzenmacher double hashing for the filter
