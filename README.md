@@ -163,25 +163,34 @@ does not.
 
 ```bash
 cargo build     # compile
-cargo run       # demo: in-memory ops, then write / drop / reopen recovery
+cargo run       # guided tour: basics, crash recovery, flush, compaction, threads
 cargo test      # 173 tests (the crash suite takes ~60s)
 cargo clippy --all-targets -- -D warnings
 ```
 
-`cargo run` prints a walkthrough of the working paths — in-memory operations, then a durable store
-that is written to, dropped, and reopened:
+`cargo run` walks through every layer against real store directories (cleaned up on exit):
 
 ```
-── put ──
-  put lang       = rust
-  put structure  = lsm-tree
-  ...
-── scan (sorted, tombstones skipped) ──
-  durable    = planned via wal
-  lang       = rust
-  structure  = lsm-tree
+2. durability — write, crash, recover
+─────────────────────────────────────
+  simulated crash on write 3: simulated crash: injected fault point reached
+  3 writes were acknowledged before the crash
+  3 keys recovered after reopening the store
+  every acknowledged write survived: true
 
-3 live keys, ~58 bytes buffered
+3. flush to an SSTable, and how a lookup narrows down
+─────────────────────────────────────────────────────
+  flushed to 0000000000-0000.sst
+    entries      5000
+    size         492 KiB
+    bloom        5992 bytes, 7 probes/key, ~1.03% false positives
+    index        120 blocks for 5000 keys (sparse: one entry per block)
+
+4. size-tiered compaction
+─────────────────────────
+  before:  5 tables, 2050 entries, 208 KiB
+  after:   2 table(s), 550 entries, 52 KiB  (1 round(s))
+  reclaimed 75% of the bytes by dropping superseded values
 ```
 
 ## Usage
