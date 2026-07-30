@@ -47,9 +47,9 @@ fn writes_survive_reopening_the_store() {
     }
 
     let db = Db::open(store.path()).unwrap();
-    assert_eq!(db.get(b"alpha"), Some(b"1".to_vec()));
-    assert_eq!(db.get(b"beta"), Some(b"2".to_vec()));
-    assert_eq!(db.len(), 2);
+    assert_eq!(db.get(b"alpha").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(db.get(b"beta").unwrap(), Some(b"2".to_vec()));
+    assert_eq!(db.len().unwrap(), 2);
 }
 
 #[test]
@@ -64,12 +64,12 @@ fn deletes_survive_reopening_and_stay_deleted() {
 
     let db = Db::open(store.path()).unwrap();
     assert_eq!(
-        db.get(b"doomed"),
+        db.get(b"doomed").unwrap(),
         None,
         "a replayed delete must stay applied"
     );
-    assert_eq!(db.get(b"kept"), Some(b"value".to_vec()));
-    assert_eq!(db.len(), 1);
+    assert_eq!(db.get(b"kept").unwrap(), Some(b"value".to_vec()));
+    assert_eq!(db.len().unwrap(), 1);
 }
 
 #[test]
@@ -83,7 +83,7 @@ fn overwrites_replay_in_order_so_the_last_write_wins() {
     }
 
     let db = Db::open(store.path()).unwrap();
-    assert_eq!(db.get(b"key"), Some(b"v3".to_vec()));
+    assert_eq!(db.get(b"key").unwrap(), Some(b"v3".to_vec()));
 }
 
 #[test]
@@ -97,14 +97,14 @@ fn a_key_rewritten_after_deletion_replays_as_live() {
     }
 
     let db = Db::open(store.path()).unwrap();
-    assert_eq!(db.get(b"phoenix"), Some(b"second".to_vec()));
+    assert_eq!(db.get(b"phoenix").unwrap(), Some(b"second".to_vec()));
 }
 
 #[test]
 fn opening_a_fresh_directory_yields_an_empty_store() {
     let store = TempStore::new("fresh");
     let db = Db::open(store.path()).unwrap();
-    assert!(db.is_empty());
+    assert!(db.is_empty().unwrap());
     assert!(db.is_durable());
     assert_eq!(db.wal_size_bytes(), 0);
 }
@@ -125,10 +125,10 @@ fn many_writes_all_survive_recovery() {
     }
 
     let db = Db::open(store.path()).unwrap();
-    assert_eq!(db.len(), 450);
+    assert_eq!(db.len().unwrap(), 450);
     for i in 0..500u32 {
         let key = format!("key:{i:04}");
-        let got = db.get(key.as_bytes());
+        let got = db.get(key.as_bytes()).unwrap();
         if i % 10 == 0 {
             assert_eq!(got, None, "{key} was deleted before the reopen");
         } else {
@@ -155,9 +155,9 @@ fn a_torn_tail_costs_only_the_unacknowledged_write() {
     drop(file);
 
     let db = Db::open(store.path()).unwrap();
-    assert_eq!(db.get(b"acked-1"), Some(b"a".to_vec()));
-    assert_eq!(db.get(b"acked-2"), Some(b"b".to_vec()));
-    assert_eq!(db.len(), 2);
+    assert_eq!(db.get(b"acked-1").unwrap(), Some(b"a".to_vec()));
+    assert_eq!(db.get(b"acked-2").unwrap(), Some(b"b".to_vec()));
+    assert_eq!(db.len().unwrap(), 2);
 }
 
 #[test]
@@ -179,13 +179,13 @@ fn recovery_repairs_the_log_so_the_store_keeps_working() {
     // Reopen, write more, and reopen again: the repaired log must be appendable.
     {
         let mut db = Db::open(store.path()).unwrap();
-        assert_eq!(db.get(b"before"), Some(b"1".to_vec()));
+        assert_eq!(db.get(b"before").unwrap(), Some(b"1".to_vec()));
         db.put(b"after", b"2").unwrap();
     }
 
     let db = Db::open(store.path()).unwrap();
-    assert_eq!(db.get(b"before"), Some(b"1".to_vec()));
-    assert_eq!(db.get(b"after"), Some(b"2".to_vec()));
+    assert_eq!(db.get(b"before").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(db.get(b"after").unwrap(), Some(b"2".to_vec()));
 }
 
 #[test]
@@ -208,9 +208,9 @@ fn corruption_in_the_log_is_caught_by_the_checksum() {
     assert_eq!(recovery.records.len(), 1);
 
     let db = Db::open(store.path()).unwrap();
-    assert_eq!(db.get(b"first"), Some(b"aaaa".to_vec()));
+    assert_eq!(db.get(b"first").unwrap(), Some(b"aaaa".to_vec()));
     assert_eq!(
-        db.get(b"second"),
+        db.get(b"second").unwrap(),
         None,
         "corrupt record must not be applied"
     );
@@ -254,7 +254,7 @@ fn buffered_policy_survives_a_clean_close() {
     }
 
     let db = Db::open(store.path()).unwrap();
-    assert_eq!(db.get(b"k"), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
 }
 
 #[test]

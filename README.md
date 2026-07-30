@@ -1,6 +1,8 @@
 # minidb
 
-An embedded log-structured merge-tree (LSM) key/value store, written in Rust with no dependencies.
+An embedded log-structured merge-tree (LSM) key/value store, written in Rust. One dependency
+(`crc32fast`, for checksums); everything else — the log format, the on-disk tables, the recovery
+logic — is written from scratch.
 
 Built to understand storage engines from the bottom up — the same family of design as RocksDB,
 LevelDB, and Cassandra's write path, implemented small enough to read in one sitting.
@@ -32,24 +34,29 @@ This is a work in progress, and the split is sharp:
 |---|---|---|
 | `memtable` | **Working** | `BTreeMap`-backed `put`/`get`/`delete`, tombstones, sorted iteration, size accounting |
 | `wal` | **Working** | crc32-checksummed append-only log, fsync-per-write, crash recovery with torn-tail truncation |
-| `lib` (`Db` API) | **Working** | In-memory (`Db::new`) or durable (`Db::open`); writes logged and fsynced before acknowledgement |
+| `lib` (`Db` API) | **Working** | In-memory or durable; writes logged + fsynced, memtable flushed to SSTables, reads merged newest-first |
 | `main` (CLI demo) | **Working** | `cargo run` exercises both the in-memory and the write-drop-reopen paths |
-| `sstable` | Scaffolded | Signatures + file layout documented; bodies are `todo!()` |
+| `sstable` | **Working** | Immutable sorted tables: crc32-checked sections, footer with magic/version, atomic publish via rename |
 | `bloom` | Scaffolded | Signatures + sizing math documented; bodies are `todo!()` |
 | `compaction` | Scaffolded | Signatures + leveled strategy documented; bodies are `todo!()` |
 
-**Durable, but not yet on-disk-resident.** A store opened with `Db::open` logs every mutation and
-fsyncs before acknowledging it, so acknowledged writes survive a crash and are replayed on reopen.
-What does *not* exist yet is the flush to SSTables — the entire dataset still lives in the memtable
-and is rebuilt from the log at startup, so memory use grows with the data and the log is never
-rotated. The `sstable`, `bloom`, and `compaction` modules compile and document their intended design,
-but their functions are `todo!()` and will panic if called.
+**Durable and on disk, but not yet fast on misses.** A store opened with `Db::open` logs every
+mutation, fsyncs before acknowledging it, and flushes the memtable to an immutable SSTable once it
+passes its size threshold. Reads search the memtable and then each table newest-first, stopping at
+the first value or tombstone. Acknowledged writes survive a crash.
 
-53 tests currently pass (`cargo test`).
+The honest gap: `SsTable::get` currently **scans the data section sequentially**, so a lookup is O(n)
+per table and a miss touches every table. The file format already reserves bloom-filter and index
+sections — both currently zero-length — so the next two milestones fill them in rather than changing
+the layout. Tables also accumulate without bound: nothing merges them yet. The `bloom` and
+`compaction` modules are still `todo!()` and will panic if called.
+
+89 tests currently pass (`cargo test`).
 
 ## Architecture
 
-The intended full design. Only the memtable box is implemented today.
+The intended full design. The WAL, memtable, and L0 SSTable boxes are implemented today; the bloom
+filter, the sparse index, and everything at L1 and below are not yet.
 
 ```
                  WRITE PATH                              READ PATH
@@ -101,15 +108,21 @@ bottom-most level and can safely drop both.
 
 ```
 ┌──────────────────────────────────────────────┐
-│ Data blocks       ~4 KiB, prefix-compressed   │
+│ Data section      entries, ascending keys     │  implemented
 ├──────────────────────────────────────────────┤
-│ Bloom filter      "definitely not here?"      │
+│ Bloom filter      "definitely not here?"      │  reserved, empty
 ├──────────────────────────────────────────────┤
-│ Sparse index      first key → block offset    │
+│ Sparse index      first key → block offset    │  reserved, empty
 ├──────────────────────────────────────────────┤
-│ Footer            offsets, magic, version     │
+│ Meta              counts, min/max key         │  implemented
+├──────────────────────────────────────────────┤
+│ Footer            offsets, crc32, magic, ver  │  implemented
 └──────────────────────────────────────────────┘
 ```
+
+Section offsets live in the fixed 76-byte footer, which carries its own checksum and a magic number
+so a truncated or foreign file is rejected before any offset is trusted. Reserving the bloom and
+index sections up front means the next two milestones extend the format instead of rewriting it.
 
 The index is sparse — one entry per block rather than per key — so it stays small enough to keep
 resident for every open table. A lookup binary-searches it, reads the single candidate block, and
@@ -124,12 +137,13 @@ immutable, this is a k-way sequential merge — cheap, restartable, and safe to 
 
 ```bash
 cargo build     # compile
-cargo run       # demo: put / get / overwrite / delete / sorted scan
-cargo test      # 24 tests, unit + integration + doctest
+cargo run       # demo: in-memory ops, then write / drop / reopen recovery
+cargo test      # 89 tests, unit + integration + doctest
 cargo clippy --all-targets -- -D warnings
 ```
 
-`cargo run` prints a walkthrough of the working in-memory path:
+`cargo run` prints a walkthrough of the working paths — in-memory operations, then a durable store
+that is written to, dropped, and reopened:
 
 ```
 ── put ──
@@ -178,8 +192,10 @@ assert_eq!(recovered.get(b"key"), Some(b"value".to_vec()));
 - [x] **Memtable** — sorted in-memory buffer with tombstones
 - [x] **Durability (WAL)** — checksummed append-only log, fsync policy, crash-recovery replay with
       truncation at the first torn record
-- [ ] **SSTables + bloom filters** — block-based immutable tables, sparse index, footer;
-      Kirsch–Mitzenmacher double hashing for the filter
+- [x] **SSTable flush** — immutable sorted tables, checksummed sections, atomic publish by rename,
+      WAL rotated only once the table is durable
+- [ ] **Bloom filters** — one per table, Kirsch–Mitzenmacher double hashing, so misses skip the read
+- [ ] **Sparse block index** — binary search to a single block instead of scanning the table
 - [ ] **Compaction** — leveled strategy, k-way merge, correct tombstone lifetime
 - [ ] **Concurrent readers/writers** — lock-free reads against immutable tables, single writer
 - [ ] **MVCC / snapshot isolation** — sequence-numbered keys, point-in-time consistent reads

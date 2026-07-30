@@ -11,10 +11,10 @@ fn writes_are_visible_to_subsequent_reads() {
     db.put(b"user:1", b"ada").unwrap();
     db.put(b"user:2", b"grace").unwrap();
 
-    assert_eq!(db.get(b"user:1"), Some(b"ada".to_vec()));
-    assert_eq!(db.get(b"user:2"), Some(b"grace".to_vec()));
-    assert_eq!(db.get(b"user:3"), None);
-    assert_eq!(db.len(), 2);
+    assert_eq!(db.get(b"user:1").unwrap(), Some(b"ada".to_vec()));
+    assert_eq!(db.get(b"user:2").unwrap(), Some(b"grace".to_vec()));
+    assert_eq!(db.get(b"user:3").unwrap(), None);
+    assert_eq!(db.len().unwrap(), 2);
 }
 
 #[test]
@@ -23,8 +23,8 @@ fn last_write_wins_for_a_repeated_key() {
     for value in ["v1", "v2", "v3"] {
         db.put(b"key", value.as_bytes()).unwrap();
     }
-    assert_eq!(db.get(b"key"), Some(b"v3".to_vec()));
-    assert_eq!(db.len(), 1);
+    assert_eq!(db.get(b"key").unwrap(), Some(b"v3".to_vec()));
+    assert_eq!(db.len().unwrap(), 1);
 }
 
 #[test]
@@ -33,16 +33,16 @@ fn delete_removes_a_key_from_reads() {
     db.put(b"doomed", b"value").unwrap();
 
     assert!(db.delete(b"doomed").unwrap());
-    assert_eq!(db.get(b"doomed"), None);
-    assert!(!db.contains(b"doomed"));
-    assert!(db.is_empty());
+    assert_eq!(db.get(b"doomed").unwrap(), None);
+    assert!(!db.contains(b"doomed").unwrap());
+    assert!(db.is_empty().unwrap());
 }
 
 #[test]
 fn delete_of_an_absent_key_reports_false() {
     let mut db = Db::new();
     assert!(!db.delete(b"never-existed").unwrap());
-    assert!(db.is_empty());
+    assert!(db.is_empty().unwrap());
 }
 
 #[test]
@@ -52,8 +52,8 @@ fn a_key_can_be_rewritten_after_deletion() {
     db.delete(b"phoenix").unwrap();
     db.put(b"phoenix", b"second").unwrap();
 
-    assert_eq!(db.get(b"phoenix"), Some(b"second".to_vec()));
-    assert_eq!(db.len(), 1);
+    assert_eq!(db.get(b"phoenix").unwrap(), Some(b"second".to_vec()));
+    assert_eq!(db.len().unwrap(), 1);
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn arbitrary_binary_keys_and_values_round_trip() {
     let value = vec![0xde, 0xad, 0xbe, 0xef, 0x00];
 
     db.put(&key, &value).unwrap();
-    assert_eq!(db.get(&key), Some(value));
+    assert_eq!(db.get(&key).unwrap(), Some(value));
 }
 
 #[test]
@@ -103,10 +103,16 @@ fn many_keys_are_all_retrievable() {
             .unwrap();
     }
 
-    assert_eq!(db.len(), 1_000);
-    assert_eq!(db.get(b"key:0000"), Some(0u32.to_be_bytes().to_vec()));
-    assert_eq!(db.get(b"key:0999"), Some(999u32.to_be_bytes().to_vec()));
-    assert_eq!(db.get(b"key:1000"), None);
+    assert_eq!(db.len().unwrap(), 1_000);
+    assert_eq!(
+        db.get(b"key:0000").unwrap(),
+        Some(0u32.to_be_bytes().to_vec())
+    );
+    assert_eq!(
+        db.get(b"key:0999").unwrap(),
+        Some(999u32.to_be_bytes().to_vec())
+    );
+    assert_eq!(db.get(b"key:1000").unwrap(), None);
 }
 
 #[test]

@@ -85,3 +85,97 @@ the parent directory a crash can lose the file even though its contents were flu
 Milestone 2 — SSTable flush: write a frozen memtable to an immutable sorted file, then rotate the
 WAL. Ordering is the whole game: table written → table fsynced → directory fsynced → *then* log
 rotated. Any other order loses data on a crash between the steps.
+
+---
+
+## Milestone 2 — SSTable flush
+
+**Status:** complete. Build, test, clippy (`-D warnings`), and fmt all clean. 89 tests pass.
+
+### What was built
+
+`src/sstable.rs`, previously a `todo!()` stub, now reads and writes real immutable tables.
+
+**File layout** — sections, with all offsets recorded in a fixed 76-byte footer:
+
+```
+[data section][bloom: empty][index: empty][meta section][footer]
+```
+
+The footer holds `data_len`, `data_crc`, the offset/length of every other section, a format version,
+its own crc32, and a magic number. Data entries are `kind | key_len | value_len | key | value`.
+
+- **`SsTableWriter`** — `create` / `append` / `finish`. Rejects out-of-order or duplicate keys rather
+  than producing a table whose binary search would be wrong later.
+- **`SsTable`** — `open` (validates footer, loads meta), `get`, `iter`, `verify`, `may_contain`.
+- **`Db::flush`** — freezes the memtable into a new table, then rotates the WAL.
+- Auto-flush when the memtable passes `DbOptions::flush_threshold_bytes`.
+- `Db::get` now searches memtable → tables newest-first, stopping at the first value *or tombstone*.
+- `Db::scan` returns the merged live view across all levels.
+
+### Key design decisions, and why
+
+**Reserved-but-empty bloom and index sections.** Milestones 3 and 4 add a bloom filter and a sparse
+index. Rather than write a format now that would need replacing twice, the footer already carries
+offset/length slots for both, currently zero. Those milestones fill in sections; they do not change
+the layout. The cost is 32 wasted footer bytes per table.
+
+**Atomic publish via `.tmp` + rename.** A table is written to `<name>.sst.tmp`, fsynced, then renamed
+into place, then the directory is fsynced. A crash mid-write leaves a stray temp file, never a
+half-built table that recovery would mistake for complete. `Db::open` deletes stray `.tmp` files, and
+the writer's `Drop` cleans up if it is abandoned without `finish`.
+
+**Flush ordering is the correctness argument.** Table written → table fsynced → directory fsynced →
+*then* WAL rotated. A crash before the rotation leaves the data in *both* the table and the log;
+replay puts it back in the memtable where it shadows the identical table entries, so reads are
+unaffected. That is the safe direction. Rotating first would lose everything the table held.
+
+**Sequence-numbered filenames, no manifest yet.** Tables are `{seq:010}.sst`, discovered by listing
+the directory and sorting numerically. Zero-padding keeps lexical and numeric order in agreement.
+This is enough while every table is a peer at L0; compaction (milestone 5) needs to know which level
+a table belongs to, which is where a real manifest becomes necessary.
+
+**`get` scans sequentially — deliberately, for now.** No index exists yet, so `SsTable::get` walks
+the data section and stops early once it passes the target key. It is O(n) and honestly documented as
+such in both the module docs and the README. Milestone 4 replaces the scan with a binary search.
+`may_contain` (min/max key check) already skips tables that cannot hold the key.
+
+**Read API became fallible.** `get`, `contains`, `len`, `is_empty`, and `scan` now return
+`io::Result`, because reads touch the disk and disk reads fail. Mechanical churn across all tests;
+no logic removed from `memtable.rs`.
+
+**`delete` returns memtable-only truth.** `Db::delete` reports whether a live value was visible *in
+the memtable*. Answering it across every level would require a full lookup on each delete, which
+defeats the append-only write path. Documented on the method rather than quietly redefined.
+
+### What is tested
+
+19 unit tests in `sstable.rs` and 17 integration tests in `tests/sstable_test.rs`:
+
+- Round-trip of values, tombstones, empty values (distinct from tombstones), binary keys, 2 000-entry
+  tables, and empty tables.
+- Out-of-order and duplicate appends rejected.
+- Metadata: counts, tombstone count, min/max key.
+- Corruption: bad magic, corrupt footer (caught by footer crc), truncated file, corrupted data
+  section (caught by `verify`).
+- Publication: nothing visible before `finish`; abandoned writer leaves no temp file; stale `.tmp`
+  removed on open.
+- Shadowing: newer table beats older; tombstone in a newer table hides an older value; memtable beats
+  every table; delete-then-rewrite across three flushes.
+- Ordering survives a reopen; sequence numbers continue after a reopen.
+- WAL rotated on flush, and data still readable afterwards.
+- Bulk: 600 keys with a third overwritten and a third deleted, verified after a reopen.
+
+### Known limitations (deliberate)
+
+- **Lookups are O(n) per table** until milestones 3 and 4.
+- **Tables accumulate without bound.** Nothing merges them; a store that is written to forever grows
+  an unbounded number of tables, and every miss touches all of them. Milestone 5.
+- `scan`/`len` materialize the whole dataset in memory. Fine for tests, wrong for production; a
+  streaming merge iterator comes with compaction.
+- No manifest file — level membership is implied by filename order.
+
+### Next
+
+Milestone 3 — bloom filters: one per table, written into the reserved section, probed before any data
+read so a miss costs a few in-memory bit tests instead of a full scan.

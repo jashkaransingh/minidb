@@ -38,7 +38,7 @@ fn demo_in_memory() -> io::Result<()> {
 
     println!("\n── get ──");
     for key in ["lang", "structure", "missing"] {
-        match db.get(key.as_bytes()) {
+        match db.get(key.as_bytes())? {
             Some(v) => println!("  get {key:<10} -> {}", String::from_utf8_lossy(&v)),
             None => println!("  get {key:<10} -> <none>"),
         }
@@ -48,7 +48,7 @@ fn demo_in_memory() -> io::Result<()> {
     db.put(b"durable", b"via wal")?;
     println!(
         "  put durable    = {}",
-        String::from_utf8_lossy(&db.get(b"durable").unwrap())
+        String::from_utf8_lossy(&db.get(b"durable")?.unwrap())
     );
 
     println!("\n── delete ──");
@@ -72,7 +72,7 @@ fn demo_in_memory() -> io::Result<()> {
 
     println!(
         "\n{} live keys, ~{} bytes buffered",
-        db.len(),
+        db.len()?,
         db.size_bytes()
     );
     Ok(())
@@ -95,11 +95,11 @@ fn demo_durability(dir: &std::path::Path) -> io::Result<()> {
     let db = Db::open(dir)?;
     println!("\n  reopened — replayed state:");
     for key in ["alpha", "beta", "gamma"] {
-        match db.get(key.as_bytes()) {
+        match db.get(key.as_bytes())? {
             Some(v) => println!("    {key:<6} -> {}", String::from_utf8_lossy(&v)),
             None => println!("    {key:<6} -> <deleted>"),
         }
     }
-    println!("\n  {} live keys recovered from the log", db.len());
+    println!("\n  {} live keys recovered from the log", db.len()?);
     Ok(())
 }
