@@ -9,8 +9,12 @@
 //! space. Reads search the memtable and then each table newest-first, filtered
 //! by key range, a [`bloom`] filter, and a sparse block index.
 //!
-//! Not yet present: concurrency (`Db` needs `&mut self` and has no internal
-//! locking), MVCC/snapshot isolation, and a streaming range-scan iterator.
+//! [`Db`] itself is single-threaded — it takes `&mut self` to write, so
+//! exclusive access is a compile-time fact and costs nothing at runtime. For
+//! multi-threaded use, [`SharedDb`] wraps it in a reader–writer lock.
+//!
+//! Not yet present: MVCC/snapshot isolation, a streaming range-scan iterator,
+//! and background (rather than inline) compaction.
 //!
 //! # Design
 //!
@@ -56,6 +60,7 @@
 
 pub mod bloom;
 pub mod compaction;
+pub mod concurrent;
 pub mod fault;
 pub mod memtable;
 pub mod sstable;
@@ -68,6 +73,7 @@ use std::path::{Path, PathBuf};
 use compaction::{Marker, merge_into, plan};
 
 pub use compaction::{COMPACTION_MARKER, CompactionConfig, CompactionTask, TableInfo};
+pub use concurrent::SharedDb;
 pub use fault::FaultPlan;
 pub use memtable::{Entry, MemTable};
 pub use sstable::{SsTable, SsTableWriter, TableMeta};

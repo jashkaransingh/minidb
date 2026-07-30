@@ -40,6 +40,7 @@ This is a work in progress, and the split is sharp:
 | `bloom` | **Working** | Sized from the textbook formula, double hashing, crc32-checked, one per table |
 | `compaction` | **Working** | Size-tiered merging, correct tombstone lifetime, journalled crash-safe table swap |
 | `fault` | **Working** | Deterministic in-process crash injection, used by the randomized crash suite |
+| `concurrent` | **Working** | `SharedDb`: `Arc<RwLock<Db>>` with an `&self` API, poison-safe |
 
 **Durable and on disk, but not yet fast on misses.** A store opened with `Db::open` logs every
 mutation, fsyncs before acknowledging it, and flushes the memtable to an immutable SSTable once it
@@ -51,15 +52,21 @@ flushed to immutable tables, and merged by size-tiered compaction. Reads filter 
 cheapest first: key range → bloom filter → binary search over the sparse index → scan one 4 KiB
 block. A **miss** is usually resolved entirely in memory; a **hit** costs a single block read.
 
-The honest gaps: **no concurrency** — `Db` takes `&mut self` to write and has no internal locking, so
-it cannot be shared across threads. Compaction runs **inline on the flushing thread**, so a large
-merge stalls writes rather than proceeding in the background. There is **no MVCC or snapshot
-isolation**, and **no range-scan iterator** — `scan()` materializes the whole live dataset in memory
-and is a test helper, not a query path.
+`Db` itself is single-threaded by design — `&mut self` makes exclusive access a compile-time fact and
+costs nothing at runtime. `SharedDb` is the opt-in wrapper for multi-threaded use: any number of
+concurrent readers, exclusive writers.
 
-159 tests currently pass (`cargo test`), including a randomized crash suite that injects a
+The honest gaps: **a write blocks every reader for its duration**, and under fsync-per-write that
+means a disk sync. Removing that stall means letting readers snapshot the immutable table list and
+read outside the lock, which needs a concurrent or double-buffered memtable — a redesign, not a
+different lock. Compaction runs **inline on the flushing thread**, so a large merge stalls writes.
+There is **no MVCC or snapshot isolation**, and **no range-scan iterator** — `scan()` materializes the
+whole live dataset in memory and is a test helper, not a query path.
+
+173 tests currently pass (`cargo test`), including a randomized crash suite that injects a
 deterministic failure partway through a log record across 150 seeded runs and verifies that every
-acknowledged write survives.
+acknowledged write survives, plus multi-threaded stress tests asserting that no reader ever observes
+a value that was never written.
 
 ## Architecture
 
@@ -157,7 +164,7 @@ does not.
 ```bash
 cargo build     # compile
 cargo run       # demo: in-memory ops, then write / drop / reopen recovery
-cargo test      # 159 tests (the crash suite takes ~60s)
+cargo test      # 173 tests (the crash suite takes ~60s)
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -217,7 +224,9 @@ assert_eq!(recovered.get(b"key"), Some(b"value".to_vec()));
 - [x] **Sparse block index** — binary search to a single block instead of scanning the table
 - [x] **Compaction** — size-tiered merging, k-way merge, correct tombstone lifetime, journalled swap
 - [x] **Crash testing** — deterministic in-process fault injection, 150 seeded randomized runs
-- [ ] **Concurrent readers/writers** — lock-free reads against immutable tables, single writer
+- [x] **Concurrent readers/writers** — `SharedDb`, an `RwLock` wrapper: parallel reads, exclusive writes
+- [ ] **Lock-free reads** — snapshot the immutable table list and read outside the lock, so a write
+      no longer stalls readers
 - [ ] **MVCC / snapshot isolation** — sequence-numbered keys, point-in-time consistent reads
 - [ ] **Range-scan iterator** — merged ordered iteration across memtable and all levels
 - [ ] **TCP wire protocol** — network server, so it is a database and not just a library

@@ -520,3 +520,71 @@ Runtime is ~63s for the crash suite, dominated by fsync-per-write across ~150 st
 All six milestones are complete. Remaining roadmap work, in order: concurrent readers/writers
 (`RwLock`-based), MVCC/snapshot isolation, a streaming range-scan iterator, a TCP wire protocol, and
 benchmarks against sled/RocksDB.
+
+---
+
+## Stretch — Concurrent readers/writers
+
+**Status:** complete. Build, test, clippy (`-D warnings`), and fmt all clean. 173 tests pass.
+
+Attempted only after the six milestones were done and green, per the task's condition that WAL,
+SSTables, and compaction be solid and tested first.
+
+### What was built
+
+`src/concurrent.rs` (new): `SharedDb`, an `Arc<RwLock<Db>>` with an `&self` API — `put`, `get`,
+`delete`, `scan`, `flush`, `compact`, `sync` — plus `read()`/`write()` guards for callers who want
+several operations under one lock acquisition.
+
+### Key design decisions, and why
+
+**A separate type, not a lock inside `Db`.** `Db` takes `&mut self` to write, which makes exclusive
+access a compile-time fact at zero runtime cost. Moving a lock inside it would charge every
+single-threaded user for synchronization they never asked for. `SharedDb` is opt-in, and `Db` is
+unchanged — no existing working code was modified to accommodate it.
+
+**Poisoning is surfaced as an error, not a panic.** If a thread panics holding the lock, `std` poisons
+it. Every method maps that to `io::Error` instead of unwrapping, so one thread's failure degrades the
+store rather than cascading a panic into every other thread. There is a test that panics a thread
+mid-write and asserts the others still get a clean error.
+
+**Guards are exposed deliberately.** `get` twice takes the lock twice, so a write can interleave.
+Callers who need a consistent multi-read view hold `read()`; callers batching mutations hold
+`write()`. Hiding the guards would have made that impossible to express.
+
+**The limitation is documented rather than hidden.** A write blocks every reader for its duration,
+and under fsync-per-write that is a disk sync. The fix is not a different lock: it is letting readers
+snapshot the immutable table list and read outside the lock, which requires a concurrent or
+double-buffered memtable. That is a redesign, it is not implemented, and there is no benchmark yet to
+justify it — all three facts are stated in the module docs and the README rather than glossed.
+
+### What is tested
+
+5 unit tests in `concurrent.rs` and 8 integration tests in `tests/concurrency_test.rs`:
+
+- `SharedDb` is statically asserted `Send + Sync`.
+- 8 reader threads × 200 reads against a stable store.
+- **No torn reads**: 6 readers loop while a writer cycles 20 keys through 50 known values; every
+  observed value must be one that was actually written. The test also asserts >1 000 reads happened,
+  so a scheduling quirk cannot make it vacuous.
+- 6 writer threads on disjoint key ranges — all 900 writes land.
+- 8 writer threads on one contended key — the survivor is one of the written values, not a blend.
+- **Stress**: 3 writers (with deletes) against a 512-byte flush threshold, so flushes and compactions
+  fire mid-run, while 4 readers hammer reads; full final state verified afterwards by replaying each
+  writer's op sequence.
+- Durability: 4 threads write, all handles drop, reopen, all 400 keys present.
+- Lock poisoning surfaces as an error in other threads.
+- Handle counting is accurate.
+
+### Known limitations (deliberate)
+
+- **Writes block reads.** See above.
+- Compaction still runs inline under the write lock, so a large merge stalls both readers and
+  writers. Backgrounding it is now unblocked by this work, but is not done.
+- No `Db`-level snapshot: `scan()` under `SharedDb` holds the read lock for its whole duration, which
+  on a large store blocks writers for a long time.
+
+### Remaining roadmap
+
+MVCC/snapshot isolation, a streaming range-scan iterator, background compaction, a TCP wire protocol,
+and benchmarks against sled/RocksDB.
