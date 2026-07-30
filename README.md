@@ -38,30 +38,30 @@ This is a work in progress, and the split is sharp:
 | `main` (CLI demo) | **Working** | `cargo run` exercises both the in-memory and the write-drop-reopen paths |
 | `sstable` | **Working** | Immutable sorted tables, 4 KiB blocks, sparse index, crc32-checked sections, atomic publish |
 | `bloom` | **Working** | Sized from the textbook formula, double hashing, crc32-checked, one per table |
-| `compaction` | Scaffolded | Signatures + leveled strategy documented; bodies are `todo!()` |
+| `compaction` | **Working** | Size-tiered merging, correct tombstone lifetime, journalled crash-safe table swap |
 
 **Durable and on disk, but not yet fast on misses.** A store opened with `Db::open` logs every
 mutation, fsyncs before acknowledging it, and flushes the memtable to an immutable SSTable once it
 passes its size threshold. Reads search the memtable and then each table newest-first, stopping at
 the first value or tombstone. Acknowledged writes survive a crash.
 
-Point lookups are now properly indexed. A read filters through four stages, cheapest first: key
-range → bloom filter → binary search over the sparse index → scan one 4 KiB block. A **miss** is
-usually resolved entirely in memory (the filter rejects >90% of absent keys), and a **hit** costs a
-single block read rather than a scan of the whole table.
+The storage engine is functionally complete for single-threaded use. Writes are logged and fsynced,
+flushed to immutable tables, and merged by size-tiered compaction. Reads filter through four stages,
+cheapest first: key range → bloom filter → binary search over the sparse index → scan one 4 KiB
+block. A **miss** is usually resolved entirely in memory; a **hit** costs a single block read.
 
-The honest gap: **tables accumulate without bound.** Nothing merges them, so every flush adds another
-table that reads may have to consult, and superseded values and tombstones are never reclaimed. That
-is compaction — the next milestone — and `compaction.rs` is still `todo!()` and will panic if called.
-There is also no concurrency: `Db` needs `&mut self` to write, and there is no locking for shared
-access.
+The honest gaps: **no concurrency** — `Db` takes `&mut self` to write and has no internal locking, so
+it cannot be shared across threads. Compaction runs **inline on the flushing thread**, so a large
+merge stalls writes rather than proceeding in the background. There is **no MVCC or snapshot
+isolation**, and **no range-scan iterator** — `scan()` materializes the whole live dataset in memory
+and is a test helper, not a query path.
 
-124 tests currently pass (`cargo test`).
+150 tests currently pass (`cargo test`).
 
 ## Architecture
 
-The intended full design. The WAL, memtable, L0 SSTable, bloom filter, and sparse index are
-implemented today; everything at L1 and below — that is, compaction — is not yet.
+The intended full design. Every box below is implemented; what remains is concurrency, MVCC, and a
+streaming range-scan iterator.
 
 ```
                  WRITE PATH                              READ PATH
@@ -133,17 +133,28 @@ The index is sparse — one entry per block rather than per key — so it stays 
 resident for every open table. A lookup binary-searches it, reads the single candidate block, and
 scans it: one disk read per table probe, and usually zero, because the bloom filter answered first.
 
-**Compaction.** L0 holds freshly flushed memtables, which may overlap each other. L1 and below hold
-non-overlapping runs, each level roughly 10× the last. When a level exceeds its budget, a table is
-merged with the overlapping tables one level down and rewritten. Because the inputs are sorted and
-immutable, this is a k-way sequential merge — cheap, restartable, and safe to run in the background.
+**Compaction.** minidb uses a **size-tiered** strategy: tables of similar size are merged into one
+larger table, so each flush's output is rewritten O(log n) times overall rather than once per level
+crossing. Two rules make it correct, and both are easy to get silently wrong:
+
+- **Inputs must be contiguous in recency order.** A merged table takes the recency slot of its newest
+  input. Merging tables 1 and 3 but not 2 would put the output above table 2 and revert every key
+  table 2 had updated.
+- **A tombstone may only be dropped when no older table can still hold a value for that key.** Here
+  that means tombstones survive unless the merge includes the oldest table in the store. Dropping one
+  early resurrects deleted data — silently.
+
+Replacing N tables with 1 is not atomic, so the swap is journalled: a marker file naming the inputs
+and the output is fsynced before the output is published. On open, recovery finishes whichever half a
+crash interrupted — deleting the inputs if the output exists, discarding the partial output if it
+does not.
 
 ## Build, run, test
 
 ```bash
 cargo build     # compile
 cargo run       # demo: in-memory ops, then write / drop / reopen recovery
-cargo test      # 124 tests, unit + integration + doctest
+cargo test      # 150 tests, unit + integration + doctest
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -201,7 +212,7 @@ assert_eq!(recovered.get(b"key"), Some(b"value".to_vec()));
       WAL rotated only once the table is durable
 - [x] **Bloom filters** — one per table, Kirsch–Mitzenmacher double hashing, so misses skip the read
 - [x] **Sparse block index** — binary search to a single block instead of scanning the table
-- [ ] **Compaction** — leveled strategy, k-way merge, correct tombstone lifetime
+- [x] **Compaction** — size-tiered merging, k-way merge, correct tombstone lifetime, journalled swap
 - [ ] **Concurrent readers/writers** — lock-free reads against immutable tables, single writer
 - [ ] **MVCC / snapshot isolation** — sequence-numbered keys, point-in-time consistent reads
 - [ ] **Range-scan iterator** — merged ordered iteration across memtable and all levels

@@ -2,12 +2,15 @@
 //!
 //! # Status
 //!
-//! The write path is durable and reaches disk: mutations are appended to a
-//! write-ahead log and fsynced before they are acknowledged, and when the
-//! memtable exceeds its threshold it is flushed to an immutable SSTable. Reads
-//! search the memtable and then each table, newest first. Bloom filters, the
-//! sparse block index, and compaction are still scaffolded — see [`bloom`] and
-//! [`compaction`].
+//! The storage engine is complete for single-threaded use. Mutations are
+//! appended to a write-ahead log and fsynced before they are acknowledged; the
+//! memtable is flushed to an immutable SSTable once it passes its threshold; and
+//! size-tiered [`compaction`] merges tables to bound read cost and reclaim
+//! space. Reads search the memtable and then each table newest-first, filtered
+//! by key range, a [`bloom`] filter, and a sparse block index.
+//!
+//! Not yet present: concurrency (`Db` needs `&mut self` and has no internal
+//! locking), MVCC/snapshot isolation, and a streaming range-scan iterator.
 //!
 //! # Design
 //!
@@ -61,6 +64,9 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use compaction::{Marker, merge_into, plan};
+
+pub use compaction::{COMPACTION_MARKER, CompactionConfig, CompactionTask, TableInfo};
 pub use memtable::{Entry, MemTable};
 pub use sstable::{SsTable, SsTableWriter, TableMeta};
 pub use wal::{Record, Recovery, SyncPolicy, Wal};
@@ -75,12 +81,16 @@ pub const WAL_FILENAME: &str = "wal.log";
 pub const SSTABLE_EXTENSION: &str = "sst";
 
 /// Tunables for a durable store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DbOptions {
     /// How aggressively the write-ahead log is fsynced.
     pub sync_policy: SyncPolicy,
     /// Memtable size that triggers a flush to a new SSTable.
     pub flush_threshold_bytes: usize,
+    /// Thresholds governing when tables are merged.
+    pub compaction: CompactionConfig,
+    /// Whether a flush automatically triggers any compaction it makes due.
+    pub auto_compact: bool,
 }
 
 impl Default for DbOptions {
@@ -88,6 +98,8 @@ impl Default for DbOptions {
         Self {
             sync_policy: SyncPolicy::EveryWrite,
             flush_threshold_bytes: MEMTABLE_FLUSH_THRESHOLD_BYTES,
+            compaction: CompactionConfig::default(),
+            auto_compact: true,
         }
     }
 }
@@ -104,7 +116,7 @@ pub struct Db {
     wal: Option<Wal>,
     dir: Option<PathBuf>,
     /// Tables ordered oldest first; later entries shadow earlier ones.
-    tables: Vec<SsTable>,
+    tables: Vec<OpenTable>,
     next_seq: u64,
     options: DbOptions,
 }
@@ -149,9 +161,9 @@ impl Db {
 
     /// Opens a durable store in `dir`, creating the directory if needed.
     ///
-    /// Recovery does three things, in order: discard any `.tmp` files left by a
-    /// crashed SSTable write, open every published table, then replay the
-    /// write-ahead log into a fresh memtable.
+    /// Recovery runs in order: finish or roll back any interrupted compaction,
+    /// discard `.tmp` files left by a crashed SSTable write, open every
+    /// published table, then replay the write-ahead log into a fresh memtable.
     ///
     /// A crash *between* publishing a table and rotating the log leaves both
     /// copies of that data present. That is the safe direction to fail: replay
@@ -161,6 +173,10 @@ impl Db {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
 
+        // Finish or roll back a compaction interrupted by a crash, before any
+        // table is opened — otherwise a merge that dropped tombstones could be
+        // read alongside the inputs it was replacing.
+        compaction::recover(&dir)?;
         remove_stale_temp_files(&dir)?;
         let (tables, next_seq) = discover_tables(&dir)?;
 
@@ -233,8 +249,8 @@ impl Db {
             None => {}
         }
 
-        for table in self.tables.iter().rev() {
-            match table.get(key)? {
+        for open in self.tables.iter().rev() {
+            match open.table.get(key)? {
                 Some(Entry::Value(v)) => return Ok(Some(v)),
                 Some(Entry::Tombstone) => return Ok(None),
                 None => {}
@@ -265,7 +281,8 @@ impl Db {
             return Ok(None);
         }
 
-        let path = dir.join(table_filename(self.next_seq));
+        let seq = self.next_seq;
+        let path = dir.join(table_filename(seq, 0));
         let mut writer = SsTableWriter::create(&path)?;
         for (key, entry) in self.memtable.iter() {
             writer.append(key, entry)?;
@@ -277,10 +294,100 @@ impl Db {
             wal.rotate()?;
         }
 
-        self.tables.push(SsTable::open(&path)?);
+        self.tables.push(OpenTable {
+            table: SsTable::open(&path)?,
+            seq,
+            generation: 0,
+        });
         self.next_seq += 1;
         self.memtable.clear();
+
+        if self.options.auto_compact {
+            self.compact_all()?;
+        }
         Ok(Some(path))
+    }
+
+    /// Runs one compaction if any size tier is over its threshold.
+    ///
+    /// Returns `true` if tables were merged. The swap is journalled, so a crash
+    /// at any point leaves the store consistent — see [`compaction`].
+    pub fn compact(&mut self) -> io::Result<bool> {
+        let Some(dir) = self.dir.clone() else {
+            return Ok(false);
+        };
+
+        let infos: Vec<TableInfo> = self
+            .tables
+            .iter()
+            .map(|open| TableInfo {
+                path: open.table.path().to_path_buf(),
+                seq: open.seq,
+                generation: open.generation,
+                size_bytes: open.table.size_bytes(),
+            })
+            .collect();
+
+        let Some(task) = plan(&infos, &self.options.compaction) else {
+            return Ok(false);
+        };
+
+        let (seq, generation) = task.output_slot();
+        let output = dir.join(table_filename(seq, generation));
+        let inputs = task.input_paths();
+
+        // Journal the swap before publishing anything, so recovery can finish
+        // whichever half a crash interrupts.
+        Marker {
+            output: output.clone(),
+            inputs: inputs.clone(),
+        }
+        .write(&dir)?;
+
+        let input_tables = inputs
+            .iter()
+            .map(SsTable::open)
+            .collect::<io::Result<Vec<_>>>()?;
+        merge_into(&input_tables, &output, task.drop_tombstones)?;
+        drop(input_tables);
+
+        // The output is durable now; retiring the inputs is safe.
+        for input in &inputs {
+            if input.exists() {
+                std::fs::remove_file(input)?;
+            }
+        }
+        wal::sync_parent_dir(&output)?;
+        Marker::clear(&dir)?;
+
+        self.reload_tables()?;
+        Ok(true)
+    }
+
+    /// Compacts repeatedly until no tier is over its threshold.
+    ///
+    /// Returns how many compactions ran.
+    pub fn compact_all(&mut self) -> io::Result<usize> {
+        let mut rounds = 0;
+        // Each round strictly reduces the table count, so this terminates; the
+        // bound is a backstop against a planner bug turning into a hang.
+        while self.compact()? {
+            rounds += 1;
+            if rounds > 1_000 {
+                break;
+            }
+        }
+        Ok(rounds)
+    }
+
+    /// Re-reads the set of tables on disk.
+    fn reload_tables(&mut self) -> io::Result<()> {
+        if let Some(dir) = self.dir.clone() {
+            let (tables, next_seq) = discover_tables(&dir)?;
+            self.tables = tables;
+            self.next_seq = self.next_seq.max(next_seq);
+        }
+        Ok(())
     }
 
     /// Flushes if the memtable has grown past the configured threshold.
@@ -302,8 +409,8 @@ impl Db {
         let mut merged: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
 
         // Oldest first, so newer writes overwrite older ones as we go.
-        for table in &self.tables {
-            for item in table.iter()? {
+        for open in &self.tables {
+            for item in open.table.iter()? {
                 let (key, entry) = item?;
                 merged.insert(key, entry);
             }
@@ -367,8 +474,14 @@ impl Db {
     }
 
     /// Borrows the on-disk tables, oldest first.
-    pub fn tables(&self) -> &[SsTable] {
-        &self.tables
+    pub fn tables(&self) -> Vec<&SsTable> {
+        self.tables.iter().map(|open| &open.table).collect()
+    }
+
+    /// Returns the recency slots `(seq, generation)` of the tables on disk,
+    /// oldest first.
+    pub fn table_slots(&self) -> Vec<(u64, u32)> {
+        self.tables.iter().map(|o| (o.seq, o.generation)).collect()
     }
 
     /// Borrows the underlying memtable.
@@ -382,18 +495,40 @@ impl Db {
     }
 }
 
-/// Returns the filename for the table with sequence number `seq`.
+/// A table on disk together with the recency slot it occupies.
+#[derive(Debug)]
+struct OpenTable {
+    table: SsTable,
+    /// Recency rank. Higher is newer.
+    seq: u64,
+    /// Generation within a `seq`, bumped each time compaction rewrites the slot.
+    generation: u32,
+}
+
+/// Returns the filename for the table in recency slot `(seq, generation)`.
 ///
-/// Zero-padded so lexical and numeric order agree, which keeps directory
-/// listings readable and makes sorting cheap.
-pub fn table_filename(seq: u64) -> String {
-    format!("{seq:010}.{SSTABLE_EXTENSION}")
+/// Both components are zero-padded so lexical and numeric order agree, which
+/// keeps directory listings readable and sorting cheap.
+///
+/// `generation` exists because compaction must give its output the recency position of
+/// its newest input — otherwise the merged table would leapfrog tables that were
+/// not part of the merge and silently shadow their newer values. The output
+/// therefore reuses that input's `seq` and takes the next `generation`, which keeps the
+/// ordering right while still producing a distinct filename.
+pub fn table_filename(seq: u64, generation: u32) -> String {
+    format!("{seq:010}-{generation:04}.{SSTABLE_EXTENSION}")
+}
+
+/// Parses a table filename stem back into its recency slot.
+fn parse_table_stem(stem: &str) -> Option<(u64, u32)> {
+    let (seq, generation) = stem.split_once('-')?;
+    Some((seq.parse().ok()?, generation.parse().ok()?))
 }
 
 /// Opens every published table in `dir`, oldest first, and returns the next
 /// free sequence number.
-fn discover_tables(dir: &Path) -> io::Result<(Vec<SsTable>, u64)> {
-    let mut found: Vec<(u64, PathBuf)> = Vec::new();
+fn discover_tables(dir: &Path) -> io::Result<(Vec<OpenTable>, u64)> {
+    let mut found: Vec<(u64, u32, PathBuf)> = Vec::new();
 
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
@@ -403,18 +538,23 @@ fn discover_tables(dir: &Path) -> io::Result<(Vec<SsTable>, u64)> {
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let Ok(seq) = stem.parse::<u64>() else {
+        let Some((seq, generation)) = parse_table_stem(stem) else {
             continue;
         };
-        found.push((seq, path));
+        found.push((seq, generation, path));
     }
 
-    found.sort_by_key(|(seq, _)| *seq);
-    let next_seq = found.last().map_or(0, |(seq, _)| seq + 1);
+    // Oldest first: by recency slot, generation breaking ties within a slot.
+    found.sort_by_key(|(seq, generation, _)| (*seq, *generation));
+    let next_seq = found.last().map_or(0, |(seq, _, _)| seq + 1);
 
     let mut tables = Vec::with_capacity(found.len());
-    for (_, path) in found {
-        tables.push(SsTable::open(&path)?);
+    for (seq, generation, path) in found {
+        tables.push(OpenTable {
+            table: SsTable::open(&path)?,
+            seq,
+            generation,
+        });
     }
     Ok((tables, next_seq))
 }
@@ -472,12 +612,33 @@ mod tests {
     }
 
     #[test]
-    fn table_filenames_sort_lexically_in_numeric_order() {
-        let mut names = vec![table_filename(10), table_filename(2), table_filename(1)];
+    fn table_filenames_sort_lexically_in_recency_order() {
+        let mut names = vec![
+            table_filename(10, 0),
+            table_filename(2, 3),
+            table_filename(2, 0),
+            table_filename(1, 0),
+        ];
         names.sort();
         assert_eq!(
             names,
-            vec![table_filename(1), table_filename(2), table_filename(10)]
+            vec![
+                table_filename(1, 0),
+                table_filename(2, 0),
+                table_filename(2, 3),
+                table_filename(10, 0),
+            ]
         );
+    }
+
+    #[test]
+    fn table_filenames_round_trip_through_parsing() {
+        for (seq, generation) in [(0u64, 0u32), (7, 2), (123_456, 9_999)] {
+            let name = table_filename(seq, generation);
+            let stem = name.strip_suffix(".sst").unwrap();
+            assert_eq!(parse_table_stem(stem), Some((seq, generation)));
+        }
+        assert_eq!(parse_table_stem("not-a-number"), None);
+        assert_eq!(parse_table_stem("0000000001"), None);
     }
 }

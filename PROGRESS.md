@@ -341,3 +341,102 @@ whose `offset + len` exceeds `data_len` rather than issuing a wild read.
 Milestone 5 — compaction: size-tiered merging of overlapping tables, with the tombstone-lifetime rule
 handled correctly (a tombstone may only be dropped when no older table can still hold a value for
 that key).
+
+---
+
+## Milestone 5 — Compaction (size-tiered)
+
+**Status:** complete. Build, test, clippy (`-D warnings`), and fmt all clean. 150 tests pass.
+
+### What was built
+
+`src/compaction.rs`, previously a `todo!()` stub, now plans and executes merges.
+
+- **`plan(tables, config)`** — size-tiered planner. Walks contiguous runs of tables whose sizes are
+  within `size_ratio` of the run's mean, and returns the widest run of at least `min_merge_width`
+  (default 4, capped at 10).
+- **`MergeIter`** — k-way merge across input tables, newest input winning on duplicate keys.
+- **`merge_into`** — drives the merge into a new table, optionally dropping tombstones.
+- **`Marker` / `recover`** — the crash-safety journal for the table swap.
+- **`Db::compact` / `Db::compact_all`**, plus `auto_compact` (on by default) after each flush.
+
+**Strategy note:** the stub's docs described *leveled* compaction. The task specified **size-tiered**,
+so the implementation and the docs are both size-tiered now. Leaving leveled docs over a size-tiered
+implementation would have been worse than no docs.
+
+### Key design decisions, and why
+
+**Inputs must be contiguous in recency order.** This is the decision the whole milestone hinges on. A
+merged table has to occupy *some* position in the newest-first read order. It takes the position of
+its newest input — which is only sound if nothing outside the merge sits between the inputs. If the
+planner picked tables 1 and 3 but skipped 2, the output would land at position 3 and shadow table 2,
+silently reverting every key table 2 had updated. So `plan` only ever proposes an unbroken run, and
+there are two tests pinning that: one on the planner directly, one end-to-end
+(`a_merged_table_does_not_shadow_newer_tables_outside_the_merge`).
+
+**A `(seq, generation)` recency slot instead of a bare sequence number.** The output needs the
+newest input's recency position *and* a filename of its own. Filenames are now
+`{seq:010}-{generation:04}.sst`, ordered by `(seq, generation)`. The output reuses the newest input's
+`seq` and takes the next `generation`. Only one table ever holds a given `seq`, so collisions cannot
+occur. The alternative — giving the output a fresh, higher `seq` — is exactly the reversion bug.
+
+**Tombstones are dropped only when the oldest table is in the merge.** A tombstone exists to shadow
+values in older tables. If any older table survives the merge, dropping the tombstone un-deletes
+whatever it was hiding. The conservative rule (`drop_tombstones = start == 0`) is easy to verify and
+costs only some retained tombstones in partial merges. Two tests cover both directions: dropped when
+the oldest participates, kept when it does not.
+
+**The swap is journalled.** Replacing N tables with 1 means publishing the output and deleting the
+inputs — two steps, not one. A crash in between leaves both, and if tombstones were dropped, the
+surviving inputs resurrect deleted keys. So a marker file naming inputs and output is fsynced *before*
+the output is published, and `recover` runs on open before any table is read:
+
+- Output exists → the merge finished; delete the inputs, clear the marker.
+- Output missing → the merge did not finish; keep the inputs, discard the partial `.tmp`, clear the
+  marker.
+
+Both branches are tested by planting a marker and reopening.
+
+**Linear-scan merge rather than a binary heap.** At most `max_merge_width` (10) tables merge at once,
+so finding the minimum key is a scan of ≤10 cursors per output entry. A heap would be asymptotically
+better and has an ordering invariant that is easy to get subtly wrong; at this width the scan is
+faster to reason about and no slower in practice. Documented on `MergeIter`.
+
+**Every copy of a duplicated key is consumed, not just the winner.** The merge advances *all* cursors
+sitting on the minimum key. Advancing only the winner would re-emit the older copies on later
+iterations, producing a table with duplicate keys — which `SsTableWriter` would then reject.
+
+### What is tested
+
+11 unit tests in `compaction.rs` and 14 integration tests in `tests/compaction_test.rs`:
+
+- **No resurrection**: a deleted key stays deleted through compaction and a reopen.
+- **Tombstones preserved** when an older table is excluded from the merge.
+- **Tombstones dropped** when the oldest table participates (asserted on `num_tombstones == 0`).
+- **No reversion**: merging four old tables does not revert a newer table's value for the same key.
+- Newest value wins for a key rewritten across four tables.
+- Space reclaimed: 400 entries over 100 keys compacts to 100 entries at less than half the bytes.
+- Planner: min width respected, size tiers separated, max width capped, widest run preferred,
+  contiguity enforced across a large intervening table.
+- **Crash recovery both ways**: marker + published output → inputs deleted; marker + no output →
+  inputs kept, partial temp discarded.
+- Auto-compaction keeps the table count under 10 across 30 flushes.
+- A mixed workload (300 writes, a third overwritten, a fifth deleted) verified after compaction and
+  reopen.
+- `compact_all` converges and leaves nothing further to do.
+
+### Known limitations (deliberate)
+
+- **Compaction is synchronous**, running inline on the thread that flushed. A large merge stalls
+  writes. Moving it to a background thread needs the concurrency work first.
+- **No concurrency at all** — `Db` takes `&mut self`; there is no locking and no `Send`/`Sync` story.
+- The planner reads sizes only; it does not consider tombstone density, so a table that is mostly
+  tombstones is not prioritized for merging.
+- Space amplification is inherent to size-tiered: several large tables may each hold a copy of the
+  same key. Leveled compaction would bound that at the cost of more write amplification.
+
+### Next
+
+Milestone 6 — in-process fault-injection crash testing: a deterministic, seeded failure point
+injected into the write path, asserting across ≥100 randomized runs that every write acknowledged
+before the simulated crash is still readable afterwards.

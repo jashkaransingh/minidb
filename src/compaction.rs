@@ -1,115 +1,544 @@
-//! Compaction — **not yet implemented**.
+//! Compaction — merging overlapping SSTables to bound read cost and reclaim space.
 //!
 //! # Why this exists
 //!
 //! Flushing memtables produces an ever-growing pile of SSTables. Left alone,
-//! that pile costs read amplification (every miss probes every table), space
+//! that pile costs read amplification (a miss probes every table), space
 //! amplification (superseded values and tombstones are never reclaimed), and
 //! eventually file-descriptor exhaustion.
 //!
-//! Compaction merges overlapping tables into fewer, larger ones. Because the
-//! inputs are sorted and immutable, a merge is a k-way sequential scan — cheap
-//! and safely restartable. It is also the only place where obsolete data is
-//! actually reclaimed.
+//! Compaction merges several tables into one. Because the inputs are sorted and
+//! immutable, a merge is a k-way sequential scan — cheap, restartable, and safe
+//! to run without blocking readers of the old files.
 //!
-//! # Leveled strategy
+//! # Strategy: size-tiered
 //!
-//! - **L0** holds freshly flushed memtables. These *may overlap* each other, so
-//!   a read must check every L0 table.
-//! - **L1+** hold non-overlapping runs, each level roughly 10× the previous. A
-//!   read touches at most one table per level.
+//! Tables of *similar size* are merged together. Each flush produces a small
+//! table; once several small tables accumulate they become one medium table,
+//! several medium tables become one large table, and so on. Compared to leveled
+//! compaction this writes far less (each byte is rewritten O(log n) times rather
+//! than on every level crossing) at the cost of higher space amplification,
+//! since several large tables can hold copies of the same key.
 //!
-//! When a level exceeds its budget, pick a table from it, find every overlapping
-//! table in the next level down, merge them, and write the result to that lower
-//! level.
+//! # The two rules that make it correct
 //!
-//! # The tombstone rule
+//! **Inputs must be contiguous in recency order.** A merged table takes the
+//! recency position of its newest input. If the planner picked tables 1 and 3
+//! but not 2, the output would sit at position 3 and shadow table 2 — silently
+//! reverting every key that table 2 had updated. [`plan`] therefore only ever
+//! proposes an unbroken run.
 //!
-//! A tombstone may only be dropped once no older table can still hold a value
-//! for that key — that means it survives until it reaches the bottom-most level
-//! participating in the merge. Dropping one early resurrects deleted data, which
-//! is the classic LSM correctness bug and is silent when it happens.
+//! **A tombstone may only be dropped when no older table can still hold a value
+//! for that key.** Dropping one early resurrects deleted data, which is the
+//! classic LSM correctness bug and is completely silent when it happens. Here
+//! that means tombstones survive unless the merge includes the *oldest* table in
+//! the store — see [`CompactionTask::drop_tombstones`].
+//!
+//! # Crash safety
+//!
+//! Replacing N tables with 1 is not a single atomic operation: the output must
+//! be published and the inputs removed. A crash in between would leave both, and
+//! if tombstones had been dropped, the surviving old tables would resurrect
+//! deleted keys.
+//!
+//! So the swap is journalled. Before the output is published, a marker file
+//! naming the inputs and the output is written and fsynced. Recovery
+//! ([`recover`]) finishes whichever half was interrupted: if the output exists,
+//! the inputs are deleted; if it does not, the inputs are kept and the partial
+//! output discarded. Either way the store lands in a consistent state, and the
+//! marker is only removed once it is there.
 
+use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::sstable::SsTable;
+use crate::memtable::Entry;
+use crate::sstable::{SsTable, SsTableIter, SsTableWriter, TableMeta};
+use crate::wal::sync_parent_dir;
 
-/// One unit of compaction work: inputs to merge and where the output belongs.
-#[derive(Debug, Clone)]
-pub struct CompactionTask {
-    /// Tables from the source level.
-    pub inputs: Vec<PathBuf>,
-    /// Overlapping tables from the destination level.
-    pub overlaps: Vec<PathBuf>,
-    pub source_level: usize,
-    pub target_level: usize,
-}
+/// Name of the journal file describing an in-flight table swap.
+pub const COMPACTION_MARKER: &str = "COMPACTION";
 
 /// Size thresholds governing when compaction is triggered.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompactionConfig {
-    /// L0 table count that triggers a merge into L1.
-    pub l0_trigger: usize,
-    /// Byte budget for L1; each deeper level gets `size_multiplier`× the last.
-    pub l1_budget_bytes: u64,
-    pub size_multiplier: u64,
+    /// Fewest tables in a size tier before they are worth merging.
+    pub min_merge_width: usize,
+    /// Most tables to merge at once, bounding the work of a single compaction.
+    pub max_merge_width: usize,
+    /// How far table sizes may differ and still count as the same tier.
+    ///
+    /// A table joins a run if its size is within this factor of the run's mean.
+    pub size_ratio: f64,
 }
 
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            l0_trigger: 4,
-            l1_budget_bytes: 10 * 1024 * 1024,
-            size_multiplier: 10,
+            min_merge_width: 4,
+            max_merge_width: 10,
+            size_ratio: 1.5,
         }
     }
 }
 
-/// Decides what to compact next.
-#[derive(Debug)]
-pub struct CompactionPlanner {
-    _private: (),
+/// What the planner knows about one table on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableInfo {
+    pub path: PathBuf,
+    /// Recency rank. Higher is newer; ties broken by `generation`.
+    pub seq: u64,
+    /// Generation within a `seq`, incremented each time that slot is rewritten.
+    pub generation: u32,
+    pub size_bytes: u64,
 }
 
-impl CompactionPlanner {
-    pub fn new(_config: CompactionConfig) -> Self {
-        todo!("store the config and the current level manifest")
+/// One unit of compaction work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionTask {
+    /// Tables to merge, oldest first. Always contiguous in recency order.
+    pub inputs: Vec<TableInfo>,
+    /// Whether tombstones may be discarded rather than carried into the output.
+    ///
+    /// Only ever true when the merge includes the oldest table in the store, so
+    /// that no surviving table can still hold a value the tombstone was hiding.
+    pub drop_tombstones: bool,
+}
+
+impl CompactionTask {
+    /// Returns the recency slot the merged output will occupy.
+    ///
+    /// The newest input's `seq`, with a bumped `generation` so the output sorts above
+    /// the table it replaces and gets a filename of its own.
+    pub fn output_slot(&self) -> (u64, u32) {
+        let newest = self.inputs.last().expect("a task always has inputs");
+        (newest.seq, newest.generation + 1)
     }
 
-    /// Returns the highest-priority task, or `None` if every level is in budget.
-    ///
-    /// TODO: check the L0 file count first, then walk L1+ looking for the level
-    /// most over its byte budget. Prefer whichever is furthest out of bounds so
-    /// a single hot level cannot starve the others.
-    pub fn plan(&self) -> Option<CompactionTask> {
-        todo!("check L0 trigger, then find the most over-budget level")
+    /// Total size of the input tables in bytes.
+    pub fn input_bytes(&self) -> u64 {
+        self.inputs.iter().map(|t| t.size_bytes).sum()
     }
 
-    /// Records a completed compaction so the next plan sees current state.
-    ///
-    /// TODO: this manifest update is the commit point. Write it durably before
-    /// deleting any input file, or a crash between the two leaves the store
-    /// referencing tables that no longer exist.
-    pub fn apply_result(&mut self, _task: &CompactionTask, _outputs: Vec<PathBuf>) {
-        todo!("update the level manifest, then retire the input tables")
+    /// Returns the input paths.
+    pub fn input_paths(&self) -> Vec<PathBuf> {
+        self.inputs.iter().map(|t| t.path.clone()).collect()
     }
 }
 
-/// Merges the tables named by `task` into new tables at the target level.
+/// Chooses the next compaction, or `None` if no tier is over its threshold.
 ///
-/// TODO: k-way merge the input iterators through a binary heap keyed on
-/// `(key, table_recency)`. On duplicate keys keep only the newest version. Drop
-/// tombstones **only** when `task.target_level` is the bottom-most level — see
-/// the tombstone rule in the module docs. Roll the output over into a new file
-/// each time it reaches the target table size.
-pub fn compact(_task: &CompactionTask) -> io::Result<Vec<PathBuf>> {
-    todo!("k-way merge inputs, dedupe by recency, conditionally drop tombstones")
+/// `tables` must be ordered oldest first. The returned task is always a
+/// contiguous run — see the module docs for why that is not optional.
+pub fn plan(tables: &[TableInfo], config: &CompactionConfig) -> Option<CompactionTask> {
+    if tables.len() < config.min_merge_width {
+        return None;
+    }
+
+    let mut best: Option<(usize, usize)> = None; // (start, width)
+
+    for start in 0..tables.len() {
+        let mut sum = 0u64;
+        let mut width = 0usize;
+
+        for candidate in tables.iter().skip(start) {
+            let size = candidate.size_bytes.max(1);
+
+            if width > 0 {
+                // Compare against the mean of the run so far: a table joins only
+                // if it is the same rough magnitude as its neighbours.
+                let mean = sum as f64 / width as f64;
+                let ratio = (size as f64 / mean).max(mean / size as f64);
+                if ratio > config.size_ratio {
+                    break;
+                }
+            }
+
+            sum += size;
+            width += 1;
+            if width == config.max_merge_width {
+                break;
+            }
+        }
+
+        if width >= config.min_merge_width {
+            // Prefer the widest run; on a tie prefer the oldest, so the bottom
+            // of the store keeps getting consolidated rather than starved.
+            let better = match best {
+                None => true,
+                Some((_, best_width)) => width > best_width,
+            };
+            if better {
+                best = Some((start, width));
+            }
+        }
+    }
+
+    let (start, width) = best?;
+    let inputs: Vec<TableInfo> = tables[start..start + width].to_vec();
+
+    Some(CompactionTask {
+        // Safe only when the oldest table in the store is part of the merge.
+        drop_tombstones: start == 0,
+        inputs,
+    })
+}
+
+/// Merges `inputs` into a single new table at `output`.
+///
+/// `inputs` must be ordered oldest first; later tables win on duplicate keys.
+/// Returns the metadata of the table produced.
+pub fn merge_into(
+    inputs: &[SsTable],
+    output: &Path,
+    drop_tombstones: bool,
+) -> io::Result<TableMeta> {
+    let mut writer = SsTableWriter::create(output)?;
+    for item in MergeIter::new(inputs)? {
+        let (key, entry) = item?;
+        if drop_tombstones && matches!(entry, Entry::Tombstone) {
+            continue;
+        }
+        writer.append(&key, &entry)?;
+    }
+    writer.finish()
 }
 
 /// Merges sorted table iterators into one ascending, deduplicated stream.
 ///
-/// TODO: the shared primitive behind both compaction and range scans.
-pub fn merge_iter(_tables: &[SsTable]) -> impl Iterator<Item = io::Result<(Vec<u8>, Vec<u8>)>> {
-    std::iter::empty()
+/// On a duplicate key the entry from the newest input wins; tombstones are
+/// preserved as entries in their own right, since a tombstone *is* the newest
+/// value for its key.
+///
+/// Implemented as a linear scan across the input cursors rather than a binary
+/// heap. A compaction merges at most `max_merge_width` tables — ten by default —
+/// so the scan compares a handful of keys per output entry, and the code has no
+/// heap-ordering invariant to get subtly wrong.
+pub struct MergeIter {
+    /// One cursor per input, in the same order as the inputs (oldest first).
+    cursors: Vec<Cursor>,
+    failed: bool,
+}
+
+struct Cursor {
+    iter: SsTableIter,
+    /// The next entry from this input, or `None` once it is exhausted.
+    head: Option<(Vec<u8>, Entry)>,
+}
+
+impl MergeIter {
+    /// Builds a merge over `inputs`, which must be ordered oldest first.
+    pub fn new(inputs: &[SsTable]) -> io::Result<Self> {
+        let mut cursors = Vec::with_capacity(inputs.len());
+        for table in inputs {
+            let mut cursor = Cursor {
+                iter: table.iter()?,
+                head: None,
+            };
+            cursor.advance()?;
+            cursors.push(cursor);
+        }
+        Ok(Self {
+            cursors,
+            failed: false,
+        })
+    }
+}
+
+impl Cursor {
+    fn advance(&mut self) -> io::Result<()> {
+        self.head = match self.iter.next() {
+            Some(Ok(item)) => Some(item),
+            Some(Err(e)) => return Err(e),
+            None => None,
+        };
+        Ok(())
+    }
+}
+
+impl Iterator for MergeIter {
+    type Item = io::Result<(Vec<u8>, Entry)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+
+        // Smallest key across all cursors.
+        let min_key = self
+            .cursors
+            .iter()
+            .filter_map(|c| c.head.as_ref().map(|(k, _)| k))
+            .min()?
+            .clone();
+
+        // Among the cursors sitting on that key, the newest input wins. Cursors
+        // are in oldest-first order, so the last match is the newest.
+        let mut winner: Option<Entry> = None;
+        for cursor in self.cursors.iter_mut() {
+            let matches = cursor
+                .head
+                .as_ref()
+                .is_some_and(|(k, _)| k.as_slice() == min_key.as_slice());
+            if !matches {
+                continue;
+            }
+            // Every copy of this key is consumed, not just the winning one.
+            winner = cursor.head.take().map(|(_, entry)| entry);
+            if let Err(e) = cursor.advance() {
+                self.failed = true;
+                return Some(Err(e));
+            }
+        }
+
+        winner.map(|entry| Ok((min_key, entry)))
+    }
+}
+
+/// A journalled table swap, describing work that must be finished or undone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Marker {
+    pub output: PathBuf,
+    pub inputs: Vec<PathBuf>,
+}
+
+impl Marker {
+    /// Serializes as one path per line: the output first, then the inputs.
+    fn encode(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&self.output.to_string_lossy());
+        out.push('\n');
+        for input in &self.inputs {
+            out.push_str(&input.to_string_lossy());
+            out.push('\n');
+        }
+        out
+    }
+
+    fn decode(text: &str) -> Option<Self> {
+        let mut lines = text.lines().filter(|l| !l.is_empty());
+        let output = PathBuf::from(lines.next()?);
+        let inputs = lines.map(PathBuf::from).collect();
+        Some(Self { output, inputs })
+    }
+
+    /// Writes the marker durably, so recovery can see it after a crash.
+    pub fn write(&self, dir: &Path) -> io::Result<()> {
+        let path = dir.join(COMPACTION_MARKER);
+        fs::write(&path, self.encode())?;
+        // The marker is worthless if it does not survive the crash it exists for.
+        fs::File::open(&path)?.sync_all()?;
+        sync_parent_dir(&path)?;
+        Ok(())
+    }
+
+    /// Reads the marker in `dir`, if one is present.
+    pub fn read(dir: &Path) -> io::Result<Option<Self>> {
+        let path = dir.join(COMPACTION_MARKER);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = fs::read_to_string(&path)?;
+        Ok(Marker::decode(&text))
+    }
+
+    /// Removes the marker, once the swap it describes is complete.
+    pub fn clear(dir: &Path) -> io::Result<()> {
+        let path = dir.join(COMPACTION_MARKER);
+        if path.exists() {
+            fs::remove_file(&path)?;
+            sync_parent_dir(&path)?;
+        }
+        Ok(())
+    }
+}
+
+/// Finishes or rolls back a compaction interrupted by a crash.
+///
+/// Called on open, before any table is read. The rule is decided by whether the
+/// output was published:
+///
+/// - **Output present** — the merge completed. Delete the inputs, which are now
+///   redundant, and clear the marker. This is the branch that matters: leaving
+///   the inputs would resurrect keys whose tombstones the merge dropped.
+/// - **Output absent** — the merge never finished. Keep the inputs, discard any
+///   partial temp file, and clear the marker.
+pub fn recover(dir: &Path) -> io::Result<()> {
+    let Some(marker) = Marker::read(dir)? else {
+        return Ok(());
+    };
+
+    if marker.output.exists() {
+        for input in &marker.inputs {
+            if input.exists() {
+                fs::remove_file(input)?;
+            }
+        }
+    } else {
+        let mut tmp = marker.output.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        if tmp.exists() {
+            fs::remove_file(&tmp)?;
+        }
+    }
+
+    sync_parent_dir(dir)?;
+    Marker::clear(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(seq: u64, size_bytes: u64) -> TableInfo {
+        TableInfo {
+            path: PathBuf::from(format!("{seq:010}-0000.sst")),
+            seq,
+            generation: 0,
+            size_bytes,
+        }
+    }
+
+    #[test]
+    fn nothing_to_do_below_the_minimum_width() {
+        let config = CompactionConfig::default();
+        let tables = vec![info(0, 100), info(1, 100), info(2, 100)];
+        assert_eq!(plan(&tables, &config), None);
+    }
+
+    #[test]
+    fn four_similar_tables_are_merged() {
+        let config = CompactionConfig::default();
+        let tables = vec![info(0, 100), info(1, 100), info(2, 100), info(3, 100)];
+
+        let task = plan(&tables, &config).expect("should plan a merge");
+        assert_eq!(task.inputs.len(), 4);
+        assert!(task.drop_tombstones, "the oldest table is included");
+        assert_eq!(task.output_slot(), (3, 1));
+    }
+
+    #[test]
+    fn tables_of_very_different_sizes_are_not_merged_together() {
+        let config = CompactionConfig::default();
+        // Sizes escalate far beyond the ratio, so no run of 4 forms.
+        let tables = vec![
+            info(0, 100),
+            info(1, 1_000),
+            info(2, 10_000),
+            info(3, 100_000),
+        ];
+        assert_eq!(plan(&tables, &config), None);
+    }
+
+    #[test]
+    fn a_size_tier_is_selected_out_of_a_mixed_store() {
+        let config = CompactionConfig::default();
+        let tables = vec![
+            info(0, 100_000), // big, old
+            info(1, 100),
+            info(2, 100),
+            info(3, 100),
+            info(4, 100),
+        ];
+
+        let task = plan(&tables, &config).expect("should plan a merge");
+        assert_eq!(
+            task.inputs.iter().map(|t| t.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(
+            !task.drop_tombstones,
+            "table 0 is older and not in the merge, so tombstones must survive"
+        );
+    }
+
+    #[test]
+    fn planned_inputs_are_always_contiguous_in_recency_order() {
+        let config = CompactionConfig::default();
+        // A big table sits between two groups of small ones.
+        let tables = vec![
+            info(0, 100),
+            info(1, 100),
+            info(2, 5_000_000),
+            info(3, 100),
+            info(4, 100),
+        ];
+        // No contiguous run of 4 similar tables exists, so nothing is planned —
+        // rather than jumping the gap and merging 0,1,3,4.
+        assert_eq!(plan(&tables, &config), None);
+    }
+
+    #[test]
+    fn a_merge_is_capped_at_the_maximum_width() {
+        let config = CompactionConfig {
+            max_merge_width: 5,
+            ..CompactionConfig::default()
+        };
+        let tables: Vec<_> = (0..20).map(|i| info(i, 100)).collect();
+
+        let task = plan(&tables, &config).expect("should plan a merge");
+        assert_eq!(task.inputs.len(), 5);
+    }
+
+    #[test]
+    fn the_widest_run_is_preferred() {
+        let config = CompactionConfig::default();
+        let tables = vec![
+            info(0, 100),
+            info(1, 100),
+            info(2, 100),
+            info(3, 100),
+            info(4, 100),
+            info(5, 100),
+        ];
+        let task = plan(&tables, &config).expect("should plan a merge");
+        assert_eq!(task.inputs.len(), 6, "all six are one tier");
+    }
+
+    #[test]
+    fn tombstones_are_only_droppable_when_the_oldest_table_participates() {
+        let config = CompactionConfig::default();
+
+        let all_old = vec![info(0, 100), info(1, 100), info(2, 100), info(3, 100)];
+        assert!(plan(&all_old, &config).unwrap().drop_tombstones);
+
+        let with_older_survivor = vec![
+            info(0, 9_000_000),
+            info(1, 100),
+            info(2, 100),
+            info(3, 100),
+            info(4, 100),
+        ];
+        assert!(!plan(&with_older_survivor, &config).unwrap().drop_tombstones);
+    }
+
+    #[test]
+    fn the_output_slot_takes_the_newest_inputs_position() {
+        let config = CompactionConfig::default();
+        let tables: Vec<_> = (0..4).map(|i| info(i, 100)).collect();
+        let task = plan(&tables, &config).unwrap();
+
+        // Newest input is seq 3 generation 0, so the output is seq 3 generation 1: it
+        // replaces that slot without leapfrogging any table outside the merge.
+        assert_eq!(task.output_slot(), (3, 1));
+        assert_eq!(task.input_bytes(), 400);
+    }
+
+    #[test]
+    fn a_marker_round_trips_through_its_encoding() {
+        let marker = Marker {
+            output: PathBuf::from("/store/0000000003-0001.sst"),
+            inputs: vec![
+                PathBuf::from("/store/0000000002-0000.sst"),
+                PathBuf::from("/store/0000000003-0000.sst"),
+            ],
+        };
+        assert_eq!(Marker::decode(&marker.encode()), Some(marker));
+    }
+
+    #[test]
+    fn an_empty_marker_decodes_to_nothing() {
+        assert_eq!(Marker::decode(""), None);
+    }
 }

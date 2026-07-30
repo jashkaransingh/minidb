@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use minidb::{Db, DbOptions, Entry, SsTable, SsTableWriter, SyncPolicy};
+use minidb::{CompactionConfig, Db, DbOptions, Entry, SsTable, SsTableWriter, SyncPolicy};
 
 /// A scratch store directory that removes itself on drop.
 struct TempStore(PathBuf);
@@ -29,6 +29,10 @@ impl TempStore {
             DbOptions {
                 sync_policy: SyncPolicy::EveryWrite,
                 flush_threshold_bytes: threshold,
+                compaction: CompactionConfig::default(),
+                // These tests exercise flush and shadowing in isolation;
+                // compaction has its own suite.
+                auto_compact: false,
             },
         )
         .unwrap()
@@ -255,7 +259,7 @@ fn sequence_numbers_continue_after_a_reopen() {
     }
 
     let files = store.sst_files();
-    assert_eq!(files, vec!["0000000000.sst", "0000000001.sst"]);
+    assert_eq!(files, vec!["0000000000-0000.sst", "0000000001-0000.sst"]);
 }
 
 #[test]
@@ -268,7 +272,7 @@ fn a_stale_temp_file_is_cleaned_up_on_open() {
     }
 
     // Simulate a crash midway through writing the next table.
-    let junk = store.path().join("0000000001.sst.tmp");
+    let junk = store.path().join("0000000001-0000.sst.tmp");
     fs::write(&junk, b"half-written garbage").unwrap();
 
     let db = store.open(usize::MAX);
