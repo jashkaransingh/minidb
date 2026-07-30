@@ -28,29 +28,25 @@ the rest of the design necessary rather than decorative:
 
 ## Status
 
-This is a work in progress, and the split is sharp:
+Every module is implemented and tested; the gaps are features not yet started, listed below the
+table and tracked in the roadmap.
 
 | Component | State | Notes |
 |---|---|---|
 | `memtable` | **Working** | `BTreeMap`-backed `put`/`get`/`delete`, tombstones, sorted iteration, size accounting |
 | `wal` | **Working** | crc32-checksummed append-only log, fsync-per-write, crash recovery with torn-tail truncation |
 | `lib` (`Db` API) | **Working** | In-memory or durable; writes logged + fsynced, memtable flushed to SSTables, reads merged newest-first |
-| `main` (CLI demo) | **Working** | `cargo run` exercises both the in-memory and the write-drop-reopen paths |
+| `main` (CLI demo) | **Working** | `cargo run` tours every layer: basics, crash recovery, flush, compaction, threads |
 | `sstable` | **Working** | Immutable sorted tables, 4 KiB blocks, sparse index, crc32-checked sections, atomic publish |
 | `bloom` | **Working** | Sized from the textbook formula, double hashing, crc32-checked, one per table |
 | `compaction` | **Working** | Size-tiered merging, correct tombstone lifetime, journalled crash-safe table swap |
 | `fault` | **Working** | Deterministic in-process crash injection, used by the randomized crash suite |
 | `concurrent` | **Working** | `SharedDb`: `Arc<RwLock<Db>>` with an `&self` API, poison-safe |
 
-**Durable and on disk, but not yet fast on misses.** A store opened with `Db::open` logs every
-mutation, fsyncs before acknowledging it, and flushes the memtable to an immutable SSTable once it
-passes its size threshold. Reads search the memtable and then each table newest-first, stopping at
-the first value or tombstone. Acknowledged writes survive a crash.
-
-The storage engine is functionally complete for single-threaded use. Writes are logged and fsynced,
-flushed to immutable tables, and merged by size-tiered compaction. Reads filter through four stages,
-cheapest first: key range → bloom filter → binary search over the sparse index → scan one 4 KiB
-block. A **miss** is usually resolved entirely in memory; a **hit** costs a single block read.
+The storage engine is functionally complete. Writes are logged and fsynced, flushed to immutable
+tables, and merged by size-tiered compaction. Reads filter through four stages, cheapest first: key
+range → bloom filter → binary search over the sparse index → scan one 4 KiB block. A **miss** is
+usually resolved entirely in memory; a **hit** costs a single block read.
 
 `Db` itself is single-threaded by design — `&mut self` makes exclusive access a compile-time fact and
 costs nothing at runtime. `SharedDb` is the opt-in wrapper for multi-threaded use: any number of
@@ -70,8 +66,8 @@ a value that was never written.
 
 ## Architecture
 
-The intended full design. Every box below is implemented; what remains is concurrency, MVCC, and a
-streaming range-scan iterator.
+Every box below is implemented. What remains is listed in the roadmap: lock-free reads, MVCC,
+a streaming range-scan iterator, background compaction, and a network layer.
 
 ```
                  WRITE PATH                              READ PATH
@@ -202,11 +198,13 @@ use minidb::Db;
 
 let mut db = Db::new();
 db.put(b"lang", b"rust")?;
-assert_eq!(db.get(b"lang"), Some(b"rust".to_vec()));
+assert_eq!(db.get(b"lang")?, Some(b"rust".to_vec()));
 
 db.delete(b"lang")?;
-assert_eq!(db.get(b"lang"), None);
+assert_eq!(db.get(b"lang")?, None);
 ```
+
+Reads return `io::Result` because they may touch the disk.
 
 Durable, backed by a directory. `put` returns only once the mutation is fsynced to the log, so an
 `Ok` return means the write survives a crash:
@@ -219,8 +217,28 @@ db.put(b"key", b"value")?;
 drop(db); // or crash here — the write is already durable
 
 let recovered = Db::open("/tmp/my-store")?;
-assert_eq!(recovered.get(b"key"), Some(b"value".to_vec()));
+assert_eq!(recovered.get(b"key")?, Some(b"value".to_vec()));
 ```
+
+Across threads. `SharedDb` is a cloneable handle over an `RwLock`: readers run in parallel, writers
+are exclusive:
+
+```rust
+use minidb::SharedDb;
+
+let db = SharedDb::open("/tmp/my-store")?;
+db.put(b"key", b"value")?;
+
+let reader = db.clone();
+std::thread::spawn(move || {
+    assert_eq!(reader.get(b"key").unwrap(), Some(b"value".to_vec()));
+})
+.join()
+.unwrap();
+```
+
+Tuning is via `DbOptions` — fsync policy, memtable flush threshold, compaction thresholds, and
+whether compaction runs automatically after a flush.
 
 ## Roadmap
 
@@ -236,6 +254,8 @@ assert_eq!(recovered.get(b"key"), Some(b"value".to_vec()));
 - [x] **Concurrent readers/writers** — `SharedDb`, an `RwLock` wrapper: parallel reads, exclusive writes
 - [ ] **Lock-free reads** — snapshot the immutable table list and read outside the lock, so a write
       no longer stalls readers
+- [ ] **Background compaction** — move merges off the writing thread, so a large merge stops
+      stalling writes
 - [ ] **MVCC / snapshot isolation** — sequence-numbered keys, point-in-time consistent reads
 - [ ] **Range-scan iterator** — merged ordered iteration across memtable and all levels
 - [ ] **TCP wire protocol** — network server, so it is a database and not just a library
