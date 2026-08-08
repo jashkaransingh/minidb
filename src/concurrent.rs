@@ -1,39 +1,33 @@
-//! Thread-safe access to a store, via a reader–writer lock.
+//! Thread-safe access to a store.
 //!
-//! # Why a separate type
+//! # This type is now a thin wrapper, and that is the news
 //!
-//! [`Db`] takes `&mut self` to write. That is the right signature for a
-//! single-threaded embedded store: it makes exclusive access a compile-time
-//! fact and costs nothing at runtime. Baking a lock into `Db` itself would make
-//! every single-threaded user pay for synchronization they never asked for.
+//! `SharedDb` used to be the whole concurrency story: an `Arc<RwLock<Db>>`
+//! wrapping a `Db` whose write methods took `&mut self`. Readers shared the
+//! lock, writers took it exclusively — which meant **a write blocked every
+//! reader for its duration**, and under fsync-per-write that duration is a disk
+//! sync.
 //!
-//! [`SharedDb`] is the opt-in wrapper: an `Arc<RwLock<Db>>` with an `&self` API,
-//! cloneable into as many handles as there are threads.
+//! That is fixed, and not by changing the lock. [`Db`] itself is now a cheap
+//! cloneable handle — `Clone + Send + Sync`, every method taking `&self` — whose
+//! readers take no lock across any I/O at all. The mechanism is documented on
+//! `Db`: readers clone an immutable view of the levels, the memtable is an
+//! insert-only lock-free structure, and structural changes swap a pointer
+//! instead of mutating shared state.
 //!
-//! # What the lock buys, and what it does not
+//! So `SharedDb` is now just `Db` with a different name. It is kept because it
+//! is a published API and existing code uses it, and because "share a store
+//! across threads" is a reasonable thing to go looking for by name. New code can
+//! use `Db` directly and lose nothing.
 //!
-//! Readers share the lock, so any number of `get`/`scan`/`len` calls proceed in
-//! parallel. Writers take it exclusively, so `put`/`delete`/`flush`/`compact`
-//! are serialized against everything else.
+//! # What changed for callers
 //!
-//! That is the honest limit of this design: **a write blocks every reader for
-//! its duration**, and under the default fsync-per-write policy a write is
-//! dominated by a disk sync. A write-heavy workload will see readers stall.
-//!
-//! Removing that stall is a bigger change than a different lock. The standard
-//! approach exploits the fact that SSTables are immutable: readers take a cheap
-//! snapshot of the table list and read outside the lock entirely, while writers
-//! touch only the memtable and the log. Doing that safely needs the memtable to
-//! be a concurrent structure (or double-buffered behind an atomic swap), which
-//! is a real redesign rather than a wrapper. It is not implemented here, and the
-//! benchmark to justify it does not exist yet either.
-//!
-//! # Poisoning
-//!
-//! If a thread panics while holding the lock, `std`'s `RwLock` marks it
-//! poisoned. Every method here surfaces that as an [`io::Error`] rather than
-//! panicking, so one thread's failure degrades the store instead of cascading
-//! into every other thread.
+//! The `read()` / `write()` guard accessors are gone. They returned
+//! `RwLockReadGuard<Db>` / `RwLockWriteGuard<Db>`, and there is no longer a
+//! `RwLock<Db>` for them to guard. Their purpose was to run several operations
+//! against one consistent view, and [`Db::snapshot`] now does that properly —
+//! it pins a point in time rather than merely excluding other threads, and it
+//! does so without blocking anyone.
 //!
 //! # Example
 //!
@@ -59,28 +53,25 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::{Db, DbOptions, SyncPolicy};
+use crate::{Db, DbOptions, Snapshot, SyncPolicy};
 
 /// A cloneable, thread-safe handle to a store.
 ///
-/// Clones share one underlying [`Db`]; the type is `Send + Sync` and is intended
-/// to be cloned once per thread.
+/// Equivalent to [`Db`], which is itself `Clone + Send + Sync`. See the module
+/// docs for why this still exists.
 #[derive(Debug, Clone)]
 pub struct SharedDb {
-    inner: Arc<RwLock<Db>>,
+    inner: Db,
 }
 
 impl SharedDb {
     /// Wraps an existing store.
     pub fn from_db(db: Db) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(db)),
-        }
+        Self { inner: db }
     }
 
-    /// Opens an in-memory store behind a lock.
+    /// Opens an in-memory store.
     pub fn new() -> Self {
         Self::from_db(Db::new())
     }
@@ -100,90 +91,92 @@ impl SharedDb {
         Ok(Self::from_db(Db::open_with_options(dir, options)?))
     }
 
-    /// Acquires shared read access.
-    ///
-    /// Use this to run several reads against one consistent view; calling
-    /// [`get`](Self::get) twice takes the lock twice and a write may interleave.
-    pub fn read(&self) -> io::Result<RwLockReadGuard<'_, Db>> {
-        self.inner.read().map_err(poisoned)
+    /// Borrows the underlying store.
+    pub fn db(&self) -> &Db {
+        &self.inner
     }
 
-    /// Acquires exclusive write access.
+    /// Takes a point-in-time snapshot.
     ///
-    /// Use this to run several mutations under one lock acquisition.
-    pub fn write(&self) -> io::Result<RwLockWriteGuard<'_, Db>> {
-        self.inner.write().map_err(poisoned)
+    /// Replaces the old `read()` guard: several reads through one snapshot see
+    /// one consistent view, and unlike a lock it blocks nothing while held.
+    pub fn snapshot(&self) -> Snapshot {
+        self.inner.snapshot()
     }
 
     /// Writes `value` at `key`, replacing any existing value.
     pub fn put(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
-        self.write()?.put(key, value)
+        self.inner.put(key, value)
     }
 
     /// Reads the value at `key`, or `None` if absent or deleted.
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        self.read()?.get(key)
+        self.inner.get(key)
     }
 
-    /// Deletes `key`, returning `true` if a live value was visible in the
-    /// memtable beforehand.
+    /// Reads the value at `key` as of `snapshot`.
+    pub fn get_at(&self, snapshot: &Snapshot, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        self.inner.get_at(snapshot, key)
+    }
+
+    /// Deletes `key`, returning `true` if a live value was visible beforehand.
     pub fn delete(&self, key: &[u8]) -> io::Result<bool> {
-        self.write()?.delete(key)
+        self.inner.delete(key)
     }
 
     /// Returns `true` if `key` currently resolves to a value.
     pub fn contains(&self, key: &[u8]) -> io::Result<bool> {
-        self.read()?.contains(key)
+        self.inner.contains(key)
     }
 
     /// Returns every live key/value pair, merged across all levels.
     pub fn scan(&self) -> io::Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-        self.read()?.scan()
+        self.inner.scan()
     }
 
     /// Returns the number of live key/value pairs.
     pub fn len(&self) -> io::Result<usize> {
-        self.read()?.len()
+        self.inner.len()
     }
 
     /// Returns `true` if the store holds no live values.
     pub fn is_empty(&self) -> io::Result<bool> {
-        self.read()?.is_empty()
+        self.inner.is_empty()
     }
 
     /// Freezes the memtable and writes it to a new SSTable.
     pub fn flush(&self) -> io::Result<Option<PathBuf>> {
-        self.write()?.flush()
+        self.inner.flush()
     }
 
     /// Runs one compaction if any size tier is over its threshold.
     pub fn compact(&self) -> io::Result<bool> {
-        self.write()?.compact()
+        self.inner.compact()
     }
 
     /// Compacts repeatedly until no tier is over its threshold.
     pub fn compact_all(&self) -> io::Result<usize> {
-        self.write()?.compact_all()
+        self.inner.compact_all()
     }
 
     /// Forces any buffered log data to stable storage.
     pub fn sync(&self) -> io::Result<()> {
-        self.write()?.sync()
+        self.inner.sync()
     }
 
     /// Returns the number of SSTables currently on disk.
     pub fn sstable_count(&self) -> io::Result<usize> {
-        Ok(self.read()?.sstable_count())
+        Ok(self.inner.sstable_count())
     }
 
     /// Returns `true` if this store is backed by a write-ahead log.
     pub fn is_durable(&self) -> io::Result<bool> {
-        Ok(self.read()?.is_durable())
+        Ok(self.inner.is_durable())
     }
 
     /// Returns the number of live handles to this store.
     pub fn handle_count(&self) -> usize {
-        Arc::strong_count(&self.inner)
+        self.inner.handle_count()
     }
 }
 
@@ -199,24 +192,16 @@ impl From<Db> for SharedDb {
     }
 }
 
-/// Converts a poisoned-lock error into an `io::Error`.
-///
-/// A poisoned lock means another thread panicked mid-mutation, so the in-memory
-/// state may be inconsistent. Reporting it is better than either panicking in
-/// every subsequent thread or silently handing out possibly-torn state.
-fn poisoned<T>(_: std::sync::PoisonError<T>) -> io::Error {
-    io::Error::other("minidb lock poisoned: a thread panicked while holding it")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `SharedDb` is only useful if it can actually cross a thread boundary.
+    /// Both handles are only useful if they can cross a thread boundary.
     #[test]
-    fn the_handle_is_send_and_sync() {
+    fn the_handles_are_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SharedDb>();
+        assert_send_sync::<Db>();
     }
 
     #[test]
@@ -243,25 +228,34 @@ mod tests {
     }
 
     #[test]
-    fn a_held_guard_gives_a_consistent_multi_read_view() {
+    fn a_snapshot_gives_a_consistent_multi_read_view() {
         let db = SharedDb::new();
         db.put(b"a", b"1").unwrap();
         db.put(b"b", b"2").unwrap();
 
-        let guard = db.read().unwrap();
-        assert_eq!(guard.get(b"a").unwrap(), Some(b"1".to_vec()));
-        assert_eq!(guard.get(b"b").unwrap(), Some(b"2".to_vec()));
-        assert_eq!(guard.len().unwrap(), 2);
+        let snap = db.snapshot();
+        // Writes landing here are invisible through `snap` — which is what the
+        // old `read()` guard was reaching for, without blocking the writer.
+        db.put(b"a", b"changed").unwrap();
+        db.put(b"c", b"3").unwrap();
+
+        assert_eq!(db.get_at(&snap, b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get_at(&snap, b"b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(db.get_at(&snap, b"c").unwrap(), None);
     }
 
     #[test]
-    fn a_write_guard_batches_mutations_under_one_acquisition() {
+    fn a_borrowed_db_is_the_same_store() {
+        let shared = SharedDb::new();
+        shared.put(b"k", b"v").unwrap();
+        assert_eq!(shared.db().get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn many_mutations_land_through_one_handle() {
         let db = SharedDb::new();
-        {
-            let mut guard = db.write().unwrap();
-            for i in 0..10u32 {
-                guard.put(format!("k{i}").as_bytes(), b"v").unwrap();
-            }
+        for i in 0..10u32 {
+            db.put(format!("k{i}").as_bytes(), b"v").unwrap();
         }
         assert_eq!(db.len().unwrap(), 10);
     }

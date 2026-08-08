@@ -325,28 +325,31 @@ fn a_shared_store_recovers_correctly_after_all_handles_are_dropped() {
 }
 
 #[test]
-fn a_panic_in_one_thread_poisons_the_lock_without_crashing_the_others() {
-    // std's RwLock poisons on panic. The wrapper must surface that as an error
-    // rather than letting every other thread panic in turn.
+fn a_panic_in_one_thread_leaves_the_store_usable_for_the_others() {
+    // The old design wrapped the whole store in one `RwLock`, so a thread that
+    // panicked while holding it poisoned the store and every later call failed.
+    // Now the write mutex guards only a log handle and an insert-only memtable,
+    // neither of which has an invariant spanning operations, so poisoning is
+    // recovered from instead of propagated: one thread's bug degrades that
+    // thread, not the database.
     let db = SharedDb::new();
-    db.put(b"k", b"v").unwrap();
+    db.put(b"before", b"v").unwrap();
 
-    let poisoner = {
+    let panicker = {
         let db = db.clone();
         thread::spawn(move || {
-            let _guard = db.write().unwrap();
-            panic!("deliberate panic while holding the write lock");
+            db.put(b"during", b"v").unwrap();
+            panic!("deliberate panic in a writer thread");
         })
     };
-    assert!(poisoner.join().is_err(), "the thread should have panicked");
+    assert!(panicker.join().is_err(), "the thread should have panicked");
 
-    // Other threads get a clean error, not a panic.
-    let err = db.get(b"k").expect_err("the lock should be poisoned");
-    assert!(
-        err.to_string().contains("poisoned"),
-        "unexpected error: {err}"
-    );
-    assert!(db.put(b"k2", b"v").is_err());
+    // Both the pre-panic write and the panicking thread's own acknowledged
+    // write are intact, and the store still accepts traffic.
+    assert_eq!(db.get(b"before").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"during").unwrap(), Some(b"v".to_vec()));
+    db.put(b"after", b"v").unwrap();
+    assert_eq!(db.get(b"after").unwrap(), Some(b"v".to_vec()));
 }
 
 #[test]

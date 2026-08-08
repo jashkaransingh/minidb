@@ -47,7 +47,7 @@ fn eager_flush(threshold: usize) -> DbOptions {
 
 #[test]
 fn a_snapshot_sees_none_of_the_writes_that_land_after_it() {
-    let mut db = Db::new();
+    let db = Db::new();
     for i in 0..50u32 {
         db.put(format!("k{i:03}").as_bytes(), b"original").unwrap();
     }
@@ -81,7 +81,7 @@ fn a_snapshot_sees_none_of_the_writes_that_land_after_it() {
 #[test]
 fn a_snapshot_survives_the_memtable_being_flushed_to_disk() {
     let store = TempStore::new("flush-boundary");
-    let mut db = Db::open_with_options(store.path(), eager_flush(4 * 1024 * 1024)).unwrap();
+    let db = Db::open_with_options(store.path(), eager_flush(4 * 1024 * 1024)).unwrap();
 
     db.put(b"k", b"v1").unwrap();
     let snap = db.snapshot();
@@ -99,7 +99,7 @@ fn a_snapshot_survives_the_memtable_being_flushed_to_disk() {
 #[test]
 fn a_snapshot_survives_versions_being_split_across_two_tables() {
     let store = TempStore::new("split-across-tables");
-    let mut db = Db::open_with_options(store.path(), eager_flush(4 * 1024 * 1024)).unwrap();
+    let db = Db::open_with_options(store.path(), eager_flush(4 * 1024 * 1024)).unwrap();
 
     db.put(b"k", b"v1").unwrap();
     db.flush().unwrap();
@@ -132,7 +132,7 @@ fn an_open_snapshot_stops_compaction_from_collecting_what_it_reads() {
         auto_compact: false,
         ..DbOptions::default()
     };
-    let mut db = Db::open_with_options(store.path(), options).unwrap();
+    let db = Db::open_with_options(store.path(), options).unwrap();
 
     db.put(b"k", b"old").unwrap();
     db.flush().unwrap();
@@ -168,7 +168,7 @@ fn compaction_collects_old_versions_once_no_snapshot_holds_them() {
         auto_compact: false,
         ..DbOptions::default()
     };
-    let mut db = Db::open_with_options(store.path(), options).unwrap();
+    let db = Db::open_with_options(store.path(), options).unwrap();
 
     // Ten versions of one key, each in its own table.
     for round in 0..10u32 {
@@ -191,7 +191,7 @@ fn compaction_collects_old_versions_once_no_snapshot_holds_them() {
 #[test]
 fn a_deleted_key_is_still_readable_at_a_snapshot_taken_before_the_delete() {
     let store = TempStore::new("delete-boundary");
-    let mut db = Db::open_with_options(store.path(), eager_flush(4 * 1024 * 1024)).unwrap();
+    let db = Db::open_with_options(store.path(), eager_flush(4 * 1024 * 1024)).unwrap();
 
     db.put(b"k", b"alive").unwrap();
     let snap = db.snapshot();
@@ -211,7 +211,7 @@ fn a_tombstone_stops_the_search_rather_than_falling_through_to_an_older_table() 
     // The classic LSM resurrection bug, checked directly: the value is in an
     // older table, the tombstone in a newer one.
     let store = TempStore::new("tombstone-stops");
-    let mut db = Db::open_with_options(store.path(), eager_flush(4 * 1024 * 1024)).unwrap();
+    let db = Db::open_with_options(store.path(), eager_flush(4 * 1024 * 1024)).unwrap();
 
     db.put(b"k", b"v").unwrap();
     db.flush().unwrap();
@@ -232,7 +232,7 @@ fn sequence_numbers_continue_from_where_a_reopen_found_them() {
     let store = TempStore::new("seq-recovery");
 
     let last_seq = {
-        let mut db = Db::open_with_options(store.path(), eager_flush(4 * 1024 * 1024)).unwrap();
+        let db = Db::open_with_options(store.path(), eager_flush(4 * 1024 * 1024)).unwrap();
         for i in 0..20u32 {
             db.put(format!("k{i}").as_bytes(), b"v").unwrap();
         }
@@ -244,7 +244,7 @@ fn sequence_numbers_continue_from_where_a_reopen_found_them() {
     };
     assert_eq!(last_seq, 20);
 
-    let mut db = Db::open(store.path()).unwrap();
+    let db = Db::open(store.path()).unwrap();
     assert_eq!(
         db.current_seq(),
         last_seq,
@@ -263,13 +263,13 @@ fn sequence_numbers_survive_a_reopen_that_replays_the_log() {
     let store = TempStore::new("seq-replay");
 
     {
-        let mut db = Db::open(store.path()).unwrap();
+        let db = Db::open(store.path()).unwrap();
         db.put(b"a", b"1").unwrap();
         db.put(b"b", b"2").unwrap();
         assert_eq!(db.current_seq(), 2);
     }
 
-    let mut db = Db::open(store.path()).unwrap();
+    let db = Db::open(store.path()).unwrap();
     assert_eq!(db.current_seq(), 2, "recovered from the log");
     db.put(b"c", b"3").unwrap();
     assert_eq!(db.current_seq(), 3);
@@ -280,7 +280,7 @@ fn every_version_reaches_disk_in_internal_key_order() {
     // The flush path writes user key ascending, sequence descending. Anything
     // else and the reader's binary search silently returns the wrong version.
     let store = TempStore::new("on-disk-order");
-    let mut db = Db::open_with_options(store.path(), eager_flush(4 * 1024 * 1024)).unwrap();
+    let db = Db::open_with_options(store.path(), eager_flush(4 * 1024 * 1024)).unwrap();
 
     for round in 0..3u32 {
         for key in ["a", "b", "c"] {
@@ -311,7 +311,7 @@ fn every_version_reaches_disk_in_internal_key_order() {
 #[test]
 fn an_empty_value_is_not_a_tombstone_at_any_snapshot() {
     let store = TempStore::new("empty-value");
-    let mut db = Db::open_with_options(store.path(), eager_flush(4 * 1024 * 1024)).unwrap();
+    let db = Db::open_with_options(store.path(), eager_flush(4 * 1024 * 1024)).unwrap();
 
     db.put(b"k", b"").unwrap();
     let snap = db.snapshot();
@@ -330,7 +330,7 @@ fn an_empty_value_is_not_a_tombstone_at_any_snapshot() {
 
 #[test]
 fn many_snapshots_at_different_points_each_read_their_own_past() {
-    let mut db = Db::new();
+    let db = Db::new();
     let mut snaps = Vec::new();
 
     for round in 0..10u32 {
@@ -359,7 +359,7 @@ fn dropping_a_snapshot_lets_compaction_reclaim_again() {
         auto_compact: false,
         ..DbOptions::default()
     };
-    let mut db = Db::open_with_options(store.path(), options).unwrap();
+    let db = Db::open_with_options(store.path(), options).unwrap();
 
     db.put(b"k", b"pinned").unwrap();
     db.flush().unwrap();
@@ -395,7 +395,7 @@ fn dropping_a_snapshot_lets_compaction_reclaim_again() {
 #[test]
 fn a_mixed_workload_is_correct_at_both_a_snapshot_and_the_present() {
     let store = TempStore::new("mixed");
-    let mut db = Db::open_with_options(store.path(), eager_flush(2 * 1024)).unwrap();
+    let db = Db::open_with_options(store.path(), eager_flush(2 * 1024)).unwrap();
 
     // 300 keys written, then a third overwritten and a fifth deleted, with a
     // snapshot taken in between. Small flush threshold, so this spans many

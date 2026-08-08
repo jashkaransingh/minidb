@@ -134,7 +134,7 @@ struct CrashRun {
 /// Stops at the first error, which the fault plan guarantees is the simulated
 /// crash. The returned model reflects only mutations whose call returned `Ok`.
 fn drive_until_crash(dir: &PathBuf, ops: &[Op], crash_at: u64) -> CrashRun {
-    let mut db = Db::open_with_options(dir, options(FaultPlan::crash_after_wal_bytes(crash_at)))
+    let db = Db::open_with_options(dir, options(FaultPlan::crash_after_wal_bytes(crash_at)))
         .expect("open should succeed");
 
     let mut model: HashMap<String, String> = HashMap::new();
@@ -266,7 +266,7 @@ fn the_store_stays_usable_after_recovering_from_a_crash() {
         // Reopen, keep writing, reopen again: recovery must leave a store that
         // works, not merely one that reads.
         {
-            let mut db = Db::open(&store.0).unwrap();
+            let db = Db::open(&store.0).unwrap();
             for i in 0..20u32 {
                 db.put(format!("post:{i:02}").as_bytes(), b"after-crash")
                     .unwrap_or_else(|e| panic!("seed {seed}: write after recovery failed: {e}"));
@@ -293,7 +293,7 @@ fn a_crash_partway_through_a_record_never_applies_that_record() {
     // decoded into a mutation.
     let store = TempStore::new("torn-record");
 
-    let mut db =
+    let db =
         Db::open_with_options(&store.0, options(FaultPlan::crash_after_wal_bytes(60))).unwrap();
 
     db.put(b"first", b"durable").unwrap();
@@ -325,7 +325,7 @@ fn every_operation_fails_after_the_crash_fires() {
     // silently keep working and appear durable.
     let store = TempStore::new("dead-after");
 
-    let mut db =
+    let db =
         Db::open_with_options(&store.0, options(FaultPlan::crash_after_wal_bytes(30))).unwrap();
 
     let mut fired = false;
@@ -350,7 +350,7 @@ fn every_operation_fails_after_the_crash_fires() {
 fn an_unarmed_fault_plan_changes_nothing() {
     let store = TempStore::new("unarmed");
 
-    let mut db = Db::open_with_options(&store.0, options(FaultPlan::none())).unwrap();
+    let db = Db::open_with_options(&store.0, options(FaultPlan::none())).unwrap();
     for i in 0..200u32 {
         db.put(format!("k{i:03}").as_bytes(), b"value").unwrap();
     }

@@ -34,6 +34,7 @@ table and tracked in the roadmap.
 | Component | State | Notes |
 |---|---|---|
 | `memtable` | **Working** | Keyed by internal key `(user_key, seq)`, ordered key-ascending/seq-descending; tombstones, sorted iteration, size accounting |
+| `skiplist` | **Working** | Single-writer, many-reader ordered skiplist; reads are lock-free pointer chasing, nodes are never removed |
 | `snapshot` | **Working** | Point-in-time read snapshots; registry of live sequence numbers that compaction reads before collecting versions |
 | `wal` | **Working** | crc32-checksummed frames carrying sequence numbers, fsync-per-frame, crash recovery with torn-tail truncation |
 | `lib` (`Db` API) | **Working** | In-memory or durable; writes logged + fsynced, memtable flushed to SSTables, reads resolved against a snapshot sequence |
@@ -42,7 +43,7 @@ table and tracked in the roadmap.
 | `bloom` | **Working** | Sized from the textbook formula, double hashing, crc32-checked, one per table |
 | `compaction` | **Working** | Size-tiered merging, correct tombstone lifetime, MVCC version collection, journalled crash-safe table swap |
 | `fault` | **Working** | Deterministic in-process crash injection, used by the randomized crash suite |
-| `concurrent` | **Working** | `SharedDb`: `Arc<RwLock<Db>>` with an `&self` API, poison-safe |
+| `concurrent` | **Working** | `SharedDb`: now a thin wrapper — `Db` is itself `Clone + Send + Sync` |
 
 The storage engine is functionally complete. Writes are logged and fsynced, flushed to immutable
 tables, and merged by size-tiered compaction. Reads filter through four stages, cheapest first: key
@@ -60,29 +61,43 @@ underneath it. The rule is stated exactly once, in the crate docs, and every lay
 Compaction is the only thing that reclaims old versions, and it will not collect anything an open
 snapshot can still reach.
 
-`Db` itself is single-threaded by design — `&mut self` makes exclusive access a compile-time fact and
-costs nothing at runtime. `SharedDb` is the opt-in wrapper for multi-threaded use: any number of
-concurrent readers, exclusive writers.
+`Db` is a cheap cloneable handle — `Clone + Send + Sync`, every method taking `&self` — and reads do
+not block behind writes:
 
-The honest gaps: **a write blocks every reader for its duration**, and under fsync-per-write that
-means a disk sync. Removing that stall means letting readers snapshot the immutable table list and
-read outside the lock, which needs a concurrent or double-buffered memtable — a redesign, not a
-different lock. Compaction runs **inline on the flushing thread**, so a large merge stalls writes.
-There is **no group-commit batching** (the log format supports it; the machinery is not built) and
-**no range-scan iterator** — `scan()` materializes the whole live dataset in memory and is a test
-helper, not a query path. There are **no benchmarks**: no throughput, latency, or write-amplification
-number has been measured, so none is claimed.
+> **A read never waits on a write, and a read never makes a write wait.**
 
-207 tests currently pass (`cargo test`), including a randomized crash suite that injects a
+A reader clones an immutable view of the levels (one `Arc` bump under a lock held for nanoseconds)
+and then does all its work holding nothing. That is possible because MVCC removed in-place mutation:
+a delete is a tombstone *insert* and an overwrite is a new version *insert*, so the memtable can be
+an insert-only lock-free skiplist whose nodes are never removed or rewritten. Flush and compaction
+build a new view and swap a pointer rather than mutating what readers hold.
+
+Measured on this machine with `cargo test --test nonblocking_test -- --nocapture`, four reader
+threads against one writer under fsync-per-write, **debug build** (a ratio, not a throughput claim):
+
+```
+point reads: 566344 reads and 519 fsynced writes in 2000ms (ratio 1091.2x)
+under flush/compaction: 522246 reads across 8 flush cycles
+```
+
+The honest gaps: **writers are still serialized with each other** — one log, one memtable writer —
+and flush and compaction hold the write mutex, so a large merge stalls *writes* (not reads).
+Compaction runs **inline**, not in the background. Unlinking compaction inputs under live readers is
+a **Unix-only** guarantee. There is **no group-commit batching** (the log format supports it; the
+machinery is not built) and **no range-scan iterator** — `scan()` materializes the whole live dataset
+in memory and is a test helper, not a query path. There are **no benchmarks**: no throughput,
+latency, or write-amplification number has been measured, so none is claimed.
+
+223 tests currently pass (`cargo test`), including a randomized crash suite that injects a
 deterministic failure partway through a log frame across 150 seeded runs and verifies that every
-acknowledged write survives, multi-threaded stress tests asserting that no reader ever observes a
-value that was never written, and 14 MVCC tests covering snapshot visibility across memtable
-flushes and compactions.
+acknowledged write survives, 14 MVCC tests covering snapshot visibility across memtable flushes and
+compactions, and 5 concurrency tests that divide the run into 100 ms buckets and assert reads
+completed in every one of them — a reader stalled behind a write leaves a hole.
 
 ## Architecture
 
-Every box below is implemented. What remains is listed in the roadmap: lock-free reads, group
-commit, a streaming range-scan iterator, background compaction, and a network layer.
+Every box below is implemented. What remains is listed in the roadmap: group commit, a streaming
+range-scan iterator, background compaction, and a network layer.
 
 ```
                  WRITE PATH                              READ PATH
@@ -93,13 +108,13 @@ commit, a streaming range-scan iterator, background compaction, and a network la
      ▼                                            ▼
   ┌─────────────────┐   append + fsync      ┌──────────────┐  found value
   │  Write-Ahead    │  ◄──── durability      │   MemTable   │  or tombstone
-  │  Log (WAL)      │        boundary        │  (BTreeMap)  │ ────────────► return
+  │  Log (WAL)      │        boundary        │  (skiplist)  │ ────────────► return
   └─────────────────┘                        └──────────────┘
      │                                            │ not found
      ▼                                            ▼
   ┌─────────────────┐                        ┌──────────────┐
   │    MemTable     │  full? freeze          │  L0 SSTables │  bloom filter
-  │   (BTreeMap)    │ ──────────┐            │  (may overlap│  rejects most
+  │   (skiplist)    │ ──────────┐            │  (may overlap│  rejects most
   └─────────────────┘           │            │   each other)│  misses in RAM
                                 ▼            └──────────────┘
                         ┌──────────────┐          │ not found
@@ -175,7 +190,7 @@ does not.
 ```bash
 cargo build     # compile
 cargo run       # guided tour: basics, crash recovery, flush, compaction, threads
-cargo test      # 207 tests (the crash suite takes ~45s)
+cargo test      # 223 tests (the crash suite takes ~45s)
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -255,22 +270,25 @@ assert_eq!(db.get_at(&snap, b"k")?, Some(b"before".to_vec()));
 Holding a snapshot also stops compaction reclaiming the versions it can reach, so it is a resource:
 drop it when done.
 
-Across threads. `SharedDb` is a cloneable handle over an `RwLock`: readers run in parallel, writers
-are exclusive:
+Across threads. `Db` is itself the thread-safe handle — clone it once per thread:
 
 ```rust
-use minidb::SharedDb;
+use minidb::Db;
 
-let db = SharedDb::open("/tmp/my-store")?;
+let db = Db::open("/tmp/my-store")?;
 db.put(b"key", b"value")?;
 
 let reader = db.clone();
 std::thread::spawn(move || {
+    // Runs without waiting on any concurrent writer.
     assert_eq!(reader.get(b"key").unwrap(), Some(b"value".to_vec()));
 })
 .join()
 .unwrap();
 ```
+
+`SharedDb` is kept as a thin wrapper over `Db` so existing code keeps compiling; new code does not
+need it.
 
 Tuning is via `DbOptions` — fsync policy, memtable flush threshold, compaction thresholds, and
 whether compaction runs automatically after a flush.
@@ -286,11 +304,11 @@ whether compaction runs automatically after a flush.
 - [x] **Sparse block index** — binary search to a single block instead of scanning the table
 - [x] **Compaction** — size-tiered merging, k-way merge, correct tombstone lifetime, journalled swap
 - [x] **Crash testing** — deterministic in-process fault injection, 150 seeded randomized runs
-- [x] **Concurrent readers/writers** — `SharedDb`, an `RwLock` wrapper: parallel reads, exclusive writes
+- [x] **Concurrent readers/writers** — `Db` is `Clone + Send + Sync`; any number of threads
 - [x] **MVCC / snapshot isolation** — sequence-numbered internal keys, point-in-time consistent
       reads, version collection gated on the oldest live snapshot
-- [ ] **Lock-free reads** — snapshot the immutable table list and read outside the lock, so a write
-      no longer stalls readers
+- [x] **Lock-free reads** — readers clone an immutable view and hold no lock across any I/O;
+      insert-only lock-free skiplist memtable
 - [ ] **Group-commit WAL batching** — one fsync per batch of concurrent writes instead of per write
 - [ ] **Range-scan iterator** — merged ordered iteration across memtable and all levels
 - [ ] **Background compaction** — move merges off the writing thread, so a large merge stops

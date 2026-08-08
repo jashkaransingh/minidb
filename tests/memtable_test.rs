@@ -7,7 +7,7 @@ use minidb::{Db, Entry, MemTable};
 
 #[test]
 fn writes_are_visible_to_subsequent_reads() {
-    let mut db = Db::new();
+    let db = Db::new();
     db.put(b"user:1", b"ada").unwrap();
     db.put(b"user:2", b"grace").unwrap();
 
@@ -19,7 +19,7 @@ fn writes_are_visible_to_subsequent_reads() {
 
 #[test]
 fn last_write_wins_for_a_repeated_key() {
-    let mut db = Db::new();
+    let db = Db::new();
     for value in ["v1", "v2", "v3"] {
         db.put(b"key", value.as_bytes()).unwrap();
     }
@@ -29,7 +29,7 @@ fn last_write_wins_for_a_repeated_key() {
 
 #[test]
 fn delete_removes_a_key_from_reads() {
-    let mut db = Db::new();
+    let db = Db::new();
     db.put(b"doomed", b"value").unwrap();
 
     assert!(db.delete(b"doomed").unwrap());
@@ -40,14 +40,14 @@ fn delete_removes_a_key_from_reads() {
 
 #[test]
 fn delete_of_an_absent_key_reports_false() {
-    let mut db = Db::new();
+    let db = Db::new();
     assert!(!db.delete(b"never-existed").unwrap());
     assert!(db.is_empty().unwrap());
 }
 
 #[test]
 fn a_key_can_be_rewritten_after_deletion() {
-    let mut db = Db::new();
+    let db = Db::new();
     db.put(b"phoenix", b"first").unwrap();
     db.delete(b"phoenix").unwrap();
     db.put(b"phoenix", b"second").unwrap();
@@ -74,7 +74,7 @@ fn deletes_leave_tombstones_rather_than_erasing_keys() {
 
 #[test]
 fn entries_iterate_in_sorted_key_order() {
-    let mut db = Db::new();
+    let db = Db::new();
     for key in ["zeta", "alpha", "mike", "bravo"] {
         db.put(key.as_bytes(), b"x").unwrap();
     }
@@ -91,7 +91,7 @@ fn entries_iterate_in_sorted_key_order() {
 
 #[test]
 fn arbitrary_binary_keys_and_values_round_trip() {
-    let mut db = Db::new();
+    let db = Db::new();
     let key = vec![0x00, 0x01, 0xfe, 0xff];
     let value = vec![0xde, 0xad, 0xbe, 0xef, 0x00];
 
@@ -101,7 +101,7 @@ fn arbitrary_binary_keys_and_values_round_trip() {
 
 #[test]
 fn many_keys_are_all_retrievable() {
-    let mut db = Db::new();
+    let db = Db::new();
     for i in 0..1_000u32 {
         db.put(format!("key:{i:04}").as_bytes(), i.to_be_bytes().as_slice())
             .unwrap();
@@ -125,7 +125,7 @@ fn buffered_size_grows_with_every_version_written() {
     // version rather than replacing one, because older snapshots may still need
     // to read what came before. Each version costs key + 8-byte sequence number
     // + payload.
-    let mut db = Db::new();
+    let db = Db::new();
     assert_eq!(db.size_bytes(), 0);
 
     db.put(b"abc", b"12345").unwrap(); // 3 + 8 + 5

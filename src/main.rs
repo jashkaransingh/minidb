@@ -35,7 +35,7 @@ fn heading(title: &str) {
 fn basics() -> io::Result<()> {
     heading("1. in-memory basics");
 
-    let mut db = Db::new();
+    let db = Db::new();
     for (key, value) in [("lang", "rust"), ("kind", "lsm-tree"), ("scratch", "temp")] {
         db.put(key.as_bytes(), value.as_bytes())?;
         println!("  put    {key:<8} = {value}");
@@ -70,7 +70,7 @@ fn durability(dir: &Path) -> io::Result<()> {
         ..DbOptions::default()
     };
 
-    let mut db = Db::open_with_options(dir, options)?;
+    let db = Db::open_with_options(dir, options)?;
     let mut acknowledged = 0;
     for i in 0..20u32 {
         match db.put(format!("key:{i:02}").as_bytes(), b"acknowledged") {
@@ -105,7 +105,7 @@ fn durability(dir: &Path) -> io::Result<()> {
 fn flush_and_lookup(dir: &Path) -> io::Result<()> {
     heading("3. flush to an SSTable, and how a lookup narrows down");
 
-    let mut db = Db::open_with_options(
+    let db = Db::open_with_options(
         dir,
         DbOptions {
             flush_threshold_bytes: usize::MAX, // flush only when asked
@@ -123,7 +123,7 @@ fn flush_and_lookup(dir: &Path) -> io::Result<()> {
 
     db.flush()?;
     let tables = db.tables();
-    let table = tables[0];
+    let table = &tables[0];
     println!("\n  flushed to {}", file_name(table.path()));
     println!("    entries      {}", table.meta().num_entries);
     println!("    size         {} KiB", table.size_bytes() / 1024);
@@ -172,7 +172,7 @@ fn flush_and_lookup(dir: &Path) -> io::Result<()> {
 fn compaction(dir: &Path) -> io::Result<()> {
     heading("4. size-tiered compaction");
 
-    let mut db = Db::open_with_options(
+    let db = Db::open_with_options(
         dir,
         DbOptions {
             flush_threshold_bytes: usize::MAX,

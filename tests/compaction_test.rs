@@ -72,7 +72,7 @@ impl Drop for TempStore {
 #[test]
 fn compaction_merges_tables_and_preserves_every_live_value() {
     let store = TempStore::new("basic");
-    let mut db = store.open_manual();
+    let db = store.open_manual();
 
     for table in 0..4u32 {
         for i in 0..50u32 {
@@ -103,7 +103,7 @@ fn a_deleted_key_never_comes_back_after_compaction() {
     // The resurrection bug: if a tombstone is dropped while an older table
     // still holds the value it was hiding, the delete silently un-happens.
     let store = TempStore::new("no-resurrection");
-    let mut db = store.open_manual();
+    let db = store.open_manual();
 
     db.put(b"victim", b"original").unwrap();
     db.put(b"bystander", b"kept").unwrap();
@@ -146,7 +146,7 @@ fn tombstones_survive_a_merge_that_excludes_older_tables() {
     // Table 0 is large and stays out of the merge, so it may still hold the
     // value the tombstone hides. Dropping the tombstone here would resurrect it.
     let store = TempStore::new("tombstone-kept");
-    let mut db = store.open_manual();
+    let db = store.open_manual();
 
     db.put(b"victim", b"original").unwrap();
     for i in 0..400u32 {
@@ -191,7 +191,7 @@ fn tombstones_survive_a_merge_that_excludes_older_tables() {
 #[test]
 fn compaction_keeps_the_newest_value_for_a_repeatedly_written_key() {
     let store = TempStore::new("newest-wins");
-    let mut db = store.open_manual();
+    let db = store.open_manual();
 
     for v in 1..=4u32 {
         db.put(b"hot", format!("v{v}").as_bytes()).unwrap();
@@ -213,7 +213,7 @@ fn a_merged_table_does_not_shadow_newer_tables_outside_the_merge() {
     // The reversion bug: if the output took a recency slot above tables that
     // were not merged, it would revert their newer values.
     let store = TempStore::new("no-reversion");
-    let mut db = store.open_manual();
+    let db = store.open_manual();
 
     // Four small tables that will merge, all writing key "k".
     for v in 1..=4u32 {
@@ -249,7 +249,7 @@ fn a_merged_table_does_not_shadow_newer_tables_outside_the_merge() {
 #[test]
 fn compaction_reclaims_space_from_superseded_values() {
     let store = TempStore::new("reclaim");
-    let mut db = store.open_manual();
+    let db = store.open_manual();
 
     // The same 100 keys rewritten across four tables: 400 entries, 100 live.
     for round in 0..4u32 {
@@ -279,7 +279,7 @@ fn compaction_reclaims_space_from_superseded_values() {
 #[test]
 fn tombstones_are_dropped_when_the_oldest_table_participates() {
     let store = TempStore::new("drop-tombstones");
-    let mut db = store.open_manual();
+    let db = store.open_manual();
 
     for i in 0..4u32 {
         db.put(format!("key:{i}").as_bytes(), b"v").unwrap();
@@ -305,7 +305,7 @@ fn tombstones_are_dropped_when_the_oldest_table_participates() {
 #[test]
 fn auto_compaction_bounds_the_table_count() {
     let store = TempStore::new("auto");
-    let mut db = store.open_auto();
+    let db = store.open_auto();
 
     for round in 0..30u32 {
         for i in 0..20u32 {
@@ -338,7 +338,7 @@ fn auto_compaction_bounds_the_table_count() {
 #[test]
 fn nothing_is_compacted_below_the_minimum_width() {
     let store = TempStore::new("below-threshold");
-    let mut db = store.open_manual();
+    let db = store.open_manual();
 
     for i in 0..3u32 {
         db.put(format!("k{i}").as_bytes(), b"v").unwrap();
@@ -354,7 +354,7 @@ fn nothing_is_compacted_below_the_minimum_width() {
 #[test]
 fn an_interrupted_compaction_with_a_published_output_is_completed_on_open() {
     let store = TempStore::new("recover-forward");
-    let mut db = store.open_manual();
+    let db = store.open_manual();
 
     for i in 0..4u32 {
         db.put(format!("k{i}").as_bytes(), b"v").unwrap();
@@ -401,7 +401,7 @@ fn an_interrupted_compaction_with_a_published_output_is_completed_on_open() {
 #[test]
 fn an_interrupted_compaction_with_no_output_rolls_back_on_open() {
     let store = TempStore::new("recover-back");
-    let mut db = store.open_manual();
+    let db = store.open_manual();
 
     for i in 0..4u32 {
         db.put(format!("k{i}").as_bytes(), b"v").unwrap();
@@ -441,7 +441,7 @@ fn an_interrupted_compaction_with_no_output_rolls_back_on_open() {
 #[test]
 fn a_workload_of_writes_overwrites_and_deletes_stays_correct_through_compaction() {
     let store = TempStore::new("workload");
-    let mut db = store.open_auto();
+    let db = store.open_auto();
 
     // Round 1: write 300 keys across several tables.
     for i in 0..300u32 {
@@ -483,7 +483,7 @@ fn a_workload_of_writes_overwrites_and_deletes_stays_correct_through_compaction(
 #[test]
 fn repeated_compaction_converges_and_stops() {
     let store = TempStore::new("converge");
-    let mut db = store.open_manual();
+    let db = store.open_manual();
 
     for i in 0..8u32 {
         db.put(format!("k{i}").as_bytes(), b"v").unwrap();

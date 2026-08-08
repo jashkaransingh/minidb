@@ -41,7 +41,7 @@ impl Drop for TempStore {
 fn writes_survive_reopening_the_store() {
     let store = TempStore::new("reopen");
     {
-        let mut db = Db::open(store.path()).unwrap();
+        let db = Db::open(store.path()).unwrap();
         db.put(b"alpha", b"1").unwrap();
         db.put(b"beta", b"2").unwrap();
     }
@@ -56,7 +56,7 @@ fn writes_survive_reopening_the_store() {
 fn deletes_survive_reopening_and_stay_deleted() {
     let store = TempStore::new("delete-survives");
     {
-        let mut db = Db::open(store.path()).unwrap();
+        let db = Db::open(store.path()).unwrap();
         db.put(b"doomed", b"value").unwrap();
         db.put(b"kept", b"value").unwrap();
         db.delete(b"doomed").unwrap();
@@ -76,7 +76,7 @@ fn deletes_survive_reopening_and_stay_deleted() {
 fn overwrites_replay_in_order_so_the_last_write_wins() {
     let store = TempStore::new("last-write-wins");
     {
-        let mut db = Db::open(store.path()).unwrap();
+        let db = Db::open(store.path()).unwrap();
         for v in ["v1", "v2", "v3"] {
             db.put(b"key", v.as_bytes()).unwrap();
         }
@@ -90,7 +90,7 @@ fn overwrites_replay_in_order_so_the_last_write_wins() {
 fn a_key_rewritten_after_deletion_replays_as_live() {
     let store = TempStore::new("resurrect");
     {
-        let mut db = Db::open(store.path()).unwrap();
+        let db = Db::open(store.path()).unwrap();
         db.put(b"phoenix", b"first").unwrap();
         db.delete(b"phoenix").unwrap();
         db.put(b"phoenix", b"second").unwrap();
@@ -113,7 +113,7 @@ fn opening_a_fresh_directory_yields_an_empty_store() {
 fn many_writes_all_survive_recovery() {
     let store = TempStore::new("bulk");
     {
-        let mut db = Db::open(store.path()).unwrap();
+        let db = Db::open(store.path()).unwrap();
         for i in 0..500u32 {
             db.put(format!("key:{i:04}").as_bytes(), &i.to_be_bytes())
                 .unwrap();
@@ -141,7 +141,7 @@ fn many_writes_all_survive_recovery() {
 fn a_torn_tail_costs_only_the_unacknowledged_write() {
     let store = TempStore::new("torn-tail");
     {
-        let mut db = Db::open(store.path()).unwrap();
+        let db = Db::open(store.path()).unwrap();
         db.put(b"acked-1", b"a").unwrap();
         db.put(b"acked-2", b"b").unwrap();
     }
@@ -164,7 +164,7 @@ fn a_torn_tail_costs_only_the_unacknowledged_write() {
 fn recovery_repairs_the_log_so_the_store_keeps_working() {
     let store = TempStore::new("repair");
     {
-        let mut db = Db::open(store.path()).unwrap();
+        let db = Db::open(store.path()).unwrap();
         db.put(b"before", b"1").unwrap();
     }
 
@@ -178,7 +178,7 @@ fn recovery_repairs_the_log_so_the_store_keeps_working() {
 
     // Reopen, write more, and reopen again: the repaired log must be appendable.
     {
-        let mut db = Db::open(store.path()).unwrap();
+        let db = Db::open(store.path()).unwrap();
         assert_eq!(db.get(b"before").unwrap(), Some(b"1".to_vec()));
         db.put(b"after", b"2").unwrap();
     }
@@ -192,7 +192,7 @@ fn recovery_repairs_the_log_so_the_store_keeps_working() {
 fn corruption_in_the_log_is_caught_by_the_checksum() {
     let store = TempStore::new("checksum");
     {
-        let mut db = Db::open(store.path()).unwrap();
+        let db = Db::open(store.path()).unwrap();
         db.put(b"first", b"aaaa").unwrap();
         db.put(b"second", b"bbbb").unwrap();
     }
@@ -220,7 +220,7 @@ fn corruption_in_the_log_is_caught_by_the_checksum() {
 fn the_log_records_exactly_the_mutations_issued() {
     let store = TempStore::new("record-stream");
     {
-        let mut db = Db::open(store.path()).unwrap();
+        let db = Db::open(store.path()).unwrap();
         db.put(b"a", b"1").unwrap();
         db.delete(b"a").unwrap();
         db.put(b"b", b"2").unwrap();
@@ -243,7 +243,7 @@ fn the_log_records_exactly_the_mutations_issued() {
 fn buffered_policy_survives_a_clean_close() {
     let store = TempStore::new("buffered");
     {
-        let mut db = Db::open_with_policy(store.path(), SyncPolicy::OsBuffered).unwrap();
+        let db = Db::open_with_policy(store.path(), SyncPolicy::OsBuffered).unwrap();
         db.put(b"k", b"v").unwrap();
         db.sync().unwrap();
     }
@@ -254,7 +254,7 @@ fn buffered_policy_survives_a_clean_close() {
 
 #[test]
 fn an_in_memory_store_writes_nothing_to_disk() {
-    let mut db = Db::new();
+    let db = Db::new();
     db.put(b"k", b"v").unwrap();
     assert!(!db.is_durable());
     assert_eq!(db.wal_size_bytes(), 0);

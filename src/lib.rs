@@ -13,9 +13,10 @@
 //! **snapshot** of that counter, so a reader sees a consistent point-in-time
 //! view even while writes land underneath it. See [`Db::snapshot`].
 //!
-//! [`Db`] itself is single-threaded — it takes `&mut self` to write, so
-//! exclusive access is a compile-time fact and costs nothing at runtime. For
-//! multi-threaded use, [`SharedDb`] wraps it in a reader–writer lock.
+//! [`Db`] is a cheap cloneable handle — `Clone + Send + Sync`, every method
+//! `&self` — and **reads never block behind writes**: a reader clones an
+//! immutable view of the levels and then searches it holding no lock at all.
+//! See [`Db`] and the `skiplist` module for how, and for what it costs.
 //!
 //! Not yet present: a streaming range-scan iterator, group-commit batching, and
 //! background (rather than inline) compaction.
@@ -67,7 +68,7 @@
 //! ```
 //! use minidb::Db;
 //!
-//! let mut db = Db::new();
+//! let db = Db::new();
 //! db.put(b"lang", b"rust")?;
 //! assert_eq!(db.get(b"lang")?, Some(b"rust".to_vec()));
 //!
@@ -81,7 +82,7 @@
 //! ```
 //! use minidb::Db;
 //!
-//! let mut db = Db::new();
+//! let db = Db::new();
 //! db.put(b"k", b"before")?;
 //!
 //! let snap = db.snapshot();
@@ -100,7 +101,7 @@
 //!
 //! # let dir = std::env::temp_dir().join("minidb-doctest-open");
 //! # let _ = fs::remove_dir_all(&dir);
-//! let mut db = Db::open(&dir)?;
+//! let db = Db::open(&dir)?;
 //! db.put(b"key", b"value")?;
 //! drop(db); // or crash here — the write is already fsynced
 //!
@@ -115,6 +116,7 @@ pub mod compaction;
 pub mod concurrent;
 pub mod fault;
 pub mod memtable;
+pub mod skiplist;
 pub mod snapshot;
 pub mod sstable;
 pub mod wal;
@@ -122,7 +124,8 @@ pub mod wal;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use compaction::{Marker, merge_into, plan};
 
@@ -176,23 +179,112 @@ impl Default for DbOptions {
 /// The durable form appends every mutation to a write-ahead log before applying
 /// it to the memtable, and flushes the memtable to an immutable SSTable once it
 /// grows past [`DbOptions::flush_threshold_bytes`].
-#[derive(Debug)]
+///
+/// # Concurrency
+///
+/// `Db` is a cheap cloneable handle: `Clone`, `Send`, and `Sync`, with every
+/// method taking `&self`. Clones share one store. The design goal is stated as
+/// an invariant:
+///
+/// > **A read never waits on a write, and a read never makes a write wait.**
+///
+/// How that is achieved, and what it costs, is documented on [`Versions`].
+#[derive(Debug, Clone)]
 pub struct Db {
-    memtable: MemTable,
-    wal: Option<Wal>,
+    core: Arc<Core>,
+}
+
+/// The shared state behind every [`Db`] handle.
+#[derive(Debug)]
+struct Core {
     dir: Option<PathBuf>,
+    options: DbOptions,
+    /// The current immutable view of everything a reader must search.
+    ///
+    /// The lock guards only the *pointer*. A reader takes it, clones one `Arc`,
+    /// and releases it — a handful of nanoseconds, never held across I/O.
+    versions: RwLock<Arc<Versions>>,
+    /// Serializes writers and owns the log. Never taken by a read path.
+    writer: Mutex<Writer>,
+    /// Sequence number the next mutation will be assigned.
+    next_write_seq: AtomicU64,
+    /// Highest sequence number that is durable *and* applied. This is the
+    /// commit point: a write becomes visible when, and only when, this advances
+    /// past it.
+    visible_seq: AtomicU64,
+    snapshots: Arc<SnapshotRegistry>,
+}
+
+/// An immutable snapshot of the levels a read has to search.
+///
+/// # Why this shape
+///
+/// The old design put the whole store behind one `RwLock`, so a write held that
+/// lock across its `fsync` and every reader queued behind the disk. Fixing that
+/// is not a matter of choosing a different lock — it needs the reader to stop
+/// sharing mutable state with the writer at all.
+///
+/// So the reader's view is an immutable value, swapped rather than mutated:
+///
+/// - **SSTables are already immutable.** Holding `Arc`s to them is free.
+/// - **The memtable is made effectively immutable** by using an insert-only
+///   structure ([`skiplist`]) whose reads are lock-free and whose nodes are
+///   never removed or rewritten. A writer appending to it cannot invalidate
+///   anything a reader is looking at.
+/// - **Structural changes — flush, compaction — build a new `Versions` and swap
+///   the pointer.** A reader that already cloned the old one keeps using it,
+///   consistently, until it finishes.
+///
+/// A read therefore holds a lock for exactly as long as it takes to clone an
+/// `Arc`, and then does all its work — memtable probes, block reads, bloom
+/// checks — holding nothing.
+///
+/// # The trade-offs, stated honestly
+///
+/// - **Writers are still serialized with each other.** One log, one memtable
+///   writer. That is a deliberate limit, not an oversight: it is what makes the
+///   memtable a *single-writer* structure, which is dramatically simpler to get
+///   right than a multi-writer lock-free one, and it is what group commit will
+///   turn into an advantage rather than a bottleneck.
+/// - **Flush and compaction hold the writer mutex**, so a large merge stalls
+///   *writes*. It does not stall reads, which is the claim being made.
+/// - **Compaction unlinks input files while readers may still hold them.** Safe
+///   on Unix, where an open descriptor keeps an unlinked file readable — which
+///   is why [`SsTable`] holds its descriptor open. Not safe on Windows; see the
+///   note on that type.
+/// - **A reader holding an old `Versions` can read stale-but-consistent data**
+///   for the duration of one operation. That is exactly snapshot semantics, so
+///   it is the intended behaviour rather than a compromise.
+#[derive(Debug)]
+struct Versions {
+    /// The memtable currently accepting writes.
+    mem: Arc<MemTable>,
+    /// Frozen memtables not yet written to disk, oldest first. Still fully
+    /// readable — a flush must not make data disappear mid-flight.
+    imm: Vec<Arc<MemTable>>,
     /// Tables ordered oldest first; later entries shadow earlier ones.
     tables: Vec<OpenTable>,
     /// Next free recency slot for a table filename. Unrelated to write
     /// sequence numbers, which version the *data*.
     next_table_seq: u64,
-    /// Sequence number the next mutation will be assigned.
-    next_write_seq: u64,
-    /// Highest sequence number that is durable and applied. Every read resolves
-    /// against this unless given an explicit snapshot.
-    visible_seq: u64,
-    snapshots: Arc<SnapshotRegistry>,
-    options: DbOptions,
+}
+
+impl Versions {
+    /// A view with an empty memtable and the given tables.
+    fn initial(tables: Vec<OpenTable>, next_table_seq: u64, mem: MemTable) -> Self {
+        Self {
+            mem: Arc::new(mem),
+            imm: Vec::new(),
+            tables,
+            next_table_seq,
+        }
+    }
+}
+
+/// State only a writer touches.
+#[derive(Debug)]
+struct Writer {
+    wal: Option<Wal>,
 }
 
 impl Default for Db {
@@ -207,16 +299,32 @@ impl Db {
     /// Nothing is written to disk and nothing survives process exit. The
     /// memtable is never flushed, so the whole dataset stays resident.
     pub fn new() -> Self {
+        Self::from_parts(
+            None,
+            DbOptions::default(),
+            Versions::initial(Vec::new(), 0, MemTable::new()),
+            Writer { wal: None },
+            0,
+        )
+    }
+
+    fn from_parts(
+        dir: Option<PathBuf>,
+        options: DbOptions,
+        versions: Versions,
+        writer: Writer,
+        max_seq: u64,
+    ) -> Self {
         Self {
-            memtable: MemTable::new(),
-            wal: None,
-            dir: None,
-            tables: Vec::new(),
-            next_table_seq: 0,
-            next_write_seq: 1,
-            visible_seq: 0,
-            snapshots: Arc::new(SnapshotRegistry::new()),
-            options: DbOptions::default(),
+            core: Arc::new(Core {
+                dir,
+                options,
+                versions: RwLock::new(Arc::new(versions)),
+                writer: Mutex::new(writer),
+                next_write_seq: AtomicU64::new(max_seq + 1),
+                visible_seq: AtomicU64::new(max_seq),
+                snapshots: Arc::new(SnapshotRegistry::new()),
+            }),
         }
     }
 
@@ -280,17 +388,39 @@ impl Db {
         let mut wal = Wal::open(&wal_path, options.sync_policy)?;
         wal.set_fault_plan(options.fault);
 
-        Ok(Self {
-            memtable,
-            wal: Some(wal),
-            dir: Some(dir),
-            tables,
-            next_table_seq,
-            next_write_seq: max_seq + 1,
-            visible_seq: max_seq,
-            snapshots: Arc::new(SnapshotRegistry::new()),
+        Ok(Self::from_parts(
+            Some(dir),
             options,
-        })
+            Versions::initial(tables, next_table_seq, memtable),
+            Writer { wal: Some(wal) },
+            max_seq,
+        ))
+    }
+
+    /// Clones the current view. Holds the lock only long enough to bump a
+    /// refcount — never across I/O.
+    fn versions(&self) -> Arc<Versions> {
+        Arc::clone(&self.core.versions.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Takes the writer mutex.
+    ///
+    /// Poisoning is recovered from rather than propagated. The state this guards
+    /// is a log handle and an insert-only memtable; neither has an invariant
+    /// that spans operations, so a panicking writer cannot leave a half-updated
+    /// structure behind.
+    fn writer(&self) -> std::sync::MutexGuard<'_, Writer> {
+        self.core.writer.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Installs a new view.
+    fn publish(&self, versions: Versions) {
+        let mut guard = self
+            .core
+            .versions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = Arc::new(versions);
     }
 
     /// Writes `value` at `key`, replacing any existing value.
@@ -301,7 +431,7 @@ impl Db {
     ///
     /// Under MVCC this *adds a version*: readers holding an older snapshot keep
     /// seeing what they saw.
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
+    pub fn put(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
         self.apply(key, Entry::Value(value.to_vec()))
     }
 
@@ -310,7 +440,7 @@ impl Db {
     /// Recorded as a tombstone rather than an erasure: older tables on disk are
     /// immutable and may still hold a value, and older snapshots must keep
     /// reading it. See [`Entry`].
-    pub fn delete(&mut self, key: &[u8]) -> io::Result<bool> {
+    pub fn delete(&self, key: &[u8]) -> io::Result<bool> {
         let existed = self.get(key)?.is_some();
         self.apply(key, Entry::Tombstone)?;
         Ok(existed)
@@ -322,20 +452,36 @@ impl Db {
     /// it is durable. `visible_seq` is advanced only after both the log append
     /// and the memtable insert have succeeded, so a reader can never observe a
     /// write that a crash would then lose.
-    fn apply(&mut self, key: &[u8], entry: Entry) -> io::Result<()> {
-        let seq = self.next_write_seq;
-        self.next_write_seq += 1;
+    fn apply(&self, key: &[u8], entry: Entry) -> io::Result<()> {
+        let mut writer = self.writer();
+        let seq = self.core.next_write_seq.fetch_add(1, Ordering::SeqCst);
 
-        if let Some(wal) = self.wal.as_mut() {
+        if let Some(wal) = writer.wal.as_mut() {
             wal.append(&Record {
                 seq,
                 key: key.to_vec(),
                 entry: entry.clone(),
             })?;
         }
-        self.memtable.insert(key, seq, entry);
-        self.visible_seq = seq;
-        self.maybe_flush()
+
+        let versions = self.versions();
+        // SAFETY: the memtable requires a single writer at a time, and the
+        // writer mutex held above is exactly that guarantee. Readers running
+        // concurrently are fine and are the point of the structure.
+        unsafe { versions.mem.insert_shared(key, seq, entry) };
+
+        // The commit point. Release pairs with the Acquire in `current_seq`, so
+        // a reader that sees this sequence necessarily sees the inserted node.
+        self.core.visible_seq.store(seq, Ordering::Release);
+
+        let full = self.core.dir.is_some()
+            && versions.mem.size_bytes() >= self.core.options.flush_threshold_bytes;
+        drop(versions);
+
+        if full {
+            self.flush_locked(&mut writer)?;
+        }
+        Ok(())
     }
 
     /// Takes a snapshot of the current sequence number.
@@ -346,12 +492,12 @@ impl Db {
     /// can reach against collection by compaction, so a long-lived snapshot
     /// costs space; drop it when done.
     pub fn snapshot(&self) -> Snapshot {
-        Snapshot::acquire(Arc::clone(&self.snapshots), self.visible_seq)
+        Snapshot::acquire(Arc::clone(&self.core.snapshots), self.current_seq())
     }
 
     /// Reads the value at `key` as of the latest acknowledged write.
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        self.get_at_seq(self.visible_seq, key)
+        self.get_at_seq(self.current_seq(), key)
     }
 
     /// Reads the value at `key` as of `snapshot`.
@@ -365,13 +511,26 @@ impl Db {
     /// below `snapshot` — value or tombstone. Stopping on a tombstone is the
     /// part that matters: continuing would find the value the tombstone exists
     /// to hide and silently un-delete it.
+    ///
+    /// No lock is held for any of it. The view is cloned up front and the search
+    /// runs against that fixed set of levels, so a flush or compaction landing
+    /// mid-read changes nothing about the answer.
     pub fn get_at_seq(&self, snapshot: u64, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        if let Some(entry) = self.memtable.get(key, snapshot) {
+        let versions = self.versions();
+
+        if let Some(entry) = versions.mem.get(key, snapshot) {
             return Ok(entry.value().map(<[u8]>::to_vec));
         }
-        for open in self.tables.iter().rev() {
+        // Frozen memtables, newest first — they sit between the active memtable
+        // and the tables in recency order.
+        for mem in versions.imm.iter().rev() {
+            if let Some(entry) = mem.get(key, snapshot) {
+                return Ok(entry.value().map(<[u8]>::to_vec));
+            }
+        }
+        for open in versions.tables.iter().rev() {
             if let Some((_, entry)) = open.table.get(key, snapshot)? {
-                return Ok(entry.value().map(|v| v.to_vec()));
+                return Ok(entry.value().map(<[u8]>::to_vec));
             }
         }
         Ok(None)
@@ -384,72 +543,140 @@ impl Db {
 
     /// Returns the sequence number of the latest acknowledged write.
     pub fn current_seq(&self) -> u64 {
-        self.visible_seq
+        self.core.visible_seq.load(Ordering::Acquire)
     }
 
     /// Borrows the registry of live snapshots.
     pub fn snapshots(&self) -> &Arc<SnapshotRegistry> {
-        &self.snapshots
+        &self.core.snapshots
     }
 
     /// Freezes the memtable and writes it to a new SSTable.
     ///
-    /// Returns the new table's path, or `None` if there was nothing to flush or
-    /// the store is in-memory.
+    /// Returns the path of the last table written, or `None` if there was
+    /// nothing to flush or the store is in-memory.
+    pub fn flush(&self) -> io::Result<Option<PathBuf>> {
+        let mut writer = self.writer();
+        self.flush_locked(&mut writer)
+    }
+
+    /// Flush, given the writer mutex is already held.
     ///
-    /// The ordering here is the whole correctness argument: the table is fully
-    /// written and fsynced, and its directory entry synced, *before* the log is
-    /// rotated. Rotating first would open a window in which a crash loses every
-    /// write the table was supposed to contain.
+    /// Three phases, and the split is the whole point:
     ///
-    /// Every version in the memtable is written, not just the newest per key —
-    /// the memtable's iteration order *is* the table's required order, and
-    /// dropping versions here would break snapshots that are still open.
-    pub fn flush(&mut self) -> io::Result<Option<PathBuf>> {
-        let Some(dir) = self.dir.clone() else {
+    /// 1. **Freeze** — under a momentary write lock, move the active memtable
+    ///    into `imm` and install a fresh one. Readers keep finding the frozen
+    ///    data because `imm` is searched; nothing disappears mid-flight.
+    /// 2. **Write** — serialize each frozen memtable to a table, holding *no*
+    ///    lock on the view. This is the slow part, and readers run through it.
+    /// 3. **Publish** — under another momentary write lock, drop the frozen
+    ///    memtables and add the new tables.
+    ///
+    /// The log is rotated between 2 and 3, and only once every frozen memtable
+    /// is durable on disk. Rotating earlier would open a window where a crash
+    /// loses data that is in neither place.
+    fn flush_locked(&self, writer: &mut Writer) -> io::Result<Option<PathBuf>> {
+        let Some(dir) = self.core.dir.clone() else {
             return Ok(None);
         };
-        if self.memtable.is_empty() {
+
+        // Phase 1: freeze, if there is anything to freeze.
+        {
+            let current = self.versions();
+            if !current.mem.is_empty() {
+                let mut imm = current.imm.clone();
+                imm.push(Arc::clone(&current.mem));
+                self.publish(Versions {
+                    mem: Arc::new(MemTable::new()),
+                    imm,
+                    tables: current.tables.clone(),
+                    next_table_seq: current.next_table_seq,
+                });
+            }
+        }
+
+        let pending = self.versions().imm.clone();
+        if pending.is_empty() {
             return Ok(None);
         }
 
-        let seq = self.next_table_seq;
-        let path = dir.join(table_filename(seq, 0));
-        let mut writer = SsTableWriter::create(&path)?;
-        for (key, entry) in self.memtable.iter() {
-            writer.append(&key.user_key, key.seq, entry)?;
+        // Phase 2: write each frozen memtable out, holding no view lock. A
+        // failure here leaves the memtables in `imm` — still readable, still in
+        // the log — and the next flush retries them.
+        let mut written = Vec::with_capacity(pending.len());
+        let mut next_seq = self.versions().next_table_seq;
+        for frozen in &pending {
+            let path = dir.join(table_filename(next_seq, 0));
+            let mut table_writer = SsTableWriter::create(&path)?;
+            for (key, entry) in frozen.iter() {
+                table_writer.append(&key.user_key, key.seq, entry)?;
+            }
+            table_writer.finish()?; // fsyncs the table and its directory entry
+            written.push(OpenTable {
+                table: Arc::new(SsTable::open(&path)?),
+                seq: next_seq,
+                generation: 0,
+            });
+            next_seq += 1;
         }
-        writer.finish()?; // fsyncs the table and its directory entry
 
-        // Only now is it safe to discard the log.
-        if let Some(wal) = self.wal.as_mut() {
+        // Every frozen memtable is now durable on disk, so the log may go. No
+        // write can have slipped in: this thread holds the writer mutex.
+        if let Some(wal) = writer.wal.as_mut() {
             wal.rotate()?;
         }
 
-        self.tables.push(OpenTable {
-            table: SsTable::open(&path)?,
-            seq,
-            generation: 0,
-        });
-        self.next_table_seq += 1;
-        self.memtable.clear();
-
-        if self.options.auto_compact {
-            self.compact_all()?;
+        // Phase 3: publish the tables and retire the frozen memtables.
+        let last_path = written.last().map(|t| t.table.path().to_path_buf());
+        {
+            let current = self.versions();
+            let mut tables = current.tables.clone();
+            tables.extend(written);
+            self.publish(Versions {
+                mem: Arc::clone(&current.mem),
+                imm: current
+                    .imm
+                    .iter()
+                    .filter(|m| !pending.iter().any(|p| Arc::ptr_eq(p, m)))
+                    .cloned()
+                    .collect(),
+                tables,
+                next_table_seq: next_seq,
+            });
         }
-        Ok(Some(path))
+
+        if self.core.options.auto_compact {
+            self.compact_all_locked(writer)?;
+        }
+        Ok(last_path)
     }
 
     /// Runs one compaction if any size tier is over its threshold.
     ///
     /// Returns `true` if tables were merged. The swap is journalled, so a crash
     /// at any point leaves the store consistent — see [`compaction`].
-    pub fn compact(&mut self) -> io::Result<bool> {
-        let Some(dir) = self.dir.clone() else {
+    pub fn compact(&self) -> io::Result<bool> {
+        let mut writer = self.writer();
+        self.compact_locked(&mut writer)
+    }
+
+    /// Compaction, given the writer mutex is already held.
+    ///
+    /// The merge itself runs with no view lock held, so readers are untouched by
+    /// it. Only the final table-list swap takes one, for the duration of a
+    /// pointer store.
+    ///
+    /// Retiring the inputs *unlinks files a reader may still be reading*. That
+    /// is safe because [`SsTable`] holds its descriptor open and an unlinked
+    /// file stays readable through it on Unix — see that type's docs for the
+    /// Windows caveat.
+    fn compact_locked(&self, _writer: &mut Writer) -> io::Result<bool> {
+        let Some(dir) = self.core.dir.clone() else {
             return Ok(false);
         };
 
-        let infos: Vec<TableInfo> = self
+        let current = self.versions();
+        let infos: Vec<TableInfo> = current
             .tables
             .iter()
             .map(|open| TableInfo {
@@ -460,7 +687,7 @@ impl Db {
             })
             .collect();
 
-        let Some(task) = plan(&infos, &self.options.compaction) else {
+        let Some(task) = plan(&infos, &self.core.options.compaction) else {
             return Ok(false);
         };
 
@@ -488,7 +715,40 @@ impl Db {
         )?;
         drop(input_tables);
 
-        // The output is durable now; retiring the inputs is safe.
+        let merged = OpenTable {
+            table: Arc::new(SsTable::open(&output)?),
+            seq,
+            generation,
+        };
+
+        // Swap the merged table in for its inputs. They are contiguous in
+        // recency order, so replacing the run in place preserves every other
+        // table's position — which is the invariant that stops a merge output
+        // from shadowing tables it never merged.
+        {
+            let current = self.versions();
+            let mut tables = Vec::with_capacity(current.tables.len());
+            let mut placed = false;
+            for open in &current.tables {
+                if inputs.iter().any(|p| p == open.table.path()) {
+                    if !placed {
+                        tables.push(merged.clone());
+                        placed = true;
+                    }
+                } else {
+                    tables.push(open.clone());
+                }
+            }
+            self.publish(Versions {
+                mem: Arc::clone(&current.mem),
+                imm: current.imm.clone(),
+                tables,
+                next_table_seq: current.next_table_seq,
+            });
+        }
+
+        // The output is durable and published; retiring the inputs is safe.
+        // Readers still holding the previous view keep their open descriptors.
         for input in &inputs {
             if input.exists() {
                 std::fs::remove_file(input)?;
@@ -497,7 +757,6 @@ impl Db {
         wal::sync_parent_dir(&output)?;
         Marker::clear(&dir)?;
 
-        self.reload_tables()?;
         Ok(true)
     }
 
@@ -509,17 +768,22 @@ impl Db {
     /// snapshot created later: any future snapshot has a sequence number at
     /// least this high, so anything kept for this one covers it too.
     fn oldest_snapshot(&self) -> u64 {
-        self.snapshots.oldest().unwrap_or(self.visible_seq)
+        self.core.snapshots.oldest().unwrap_or(self.current_seq())
     }
 
     /// Compacts repeatedly until no tier is over its threshold.
     ///
     /// Returns how many compactions ran.
-    pub fn compact_all(&mut self) -> io::Result<usize> {
+    pub fn compact_all(&self) -> io::Result<usize> {
+        let mut writer = self.writer();
+        self.compact_all_locked(&mut writer)
+    }
+
+    fn compact_all_locked(&self, writer: &mut Writer) -> io::Result<usize> {
         let mut rounds = 0;
         // Each round strictly reduces the table count, so this terminates; the
         // bound is a backstop against a planner bug turning into a hang.
-        while self.compact()? {
+        while self.compact_locked(writer)? {
             rounds += 1;
             if rounds > 1_000 {
                 break;
@@ -528,31 +792,13 @@ impl Db {
         Ok(rounds)
     }
 
-    /// Re-reads the set of tables on disk.
-    fn reload_tables(&mut self) -> io::Result<()> {
-        if let Some(dir) = self.dir.clone() {
-            let (tables, next_table_seq) = discover_tables(&dir)?;
-            self.tables = tables;
-            self.next_table_seq = self.next_table_seq.max(next_table_seq);
-        }
-        Ok(())
-    }
-
-    /// Flushes if the memtable has grown past the configured threshold.
-    fn maybe_flush(&mut self) -> io::Result<()> {
-        if self.dir.is_some() && self.memtable.size_bytes() >= self.options.flush_threshold_bytes {
-            self.flush()?;
-        }
-        Ok(())
-    }
-
     /// Returns every live key/value pair as of the latest acknowledged write.
     ///
     /// This materializes the whole dataset in memory and reads every table end
     /// to end. It is a diagnostic and test helper, not a hot path — a streaming
     /// merge iterator is the next milestone.
     pub fn scan(&self) -> io::Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-        self.scan_at_seq(self.visible_seq)
+        self.scan_at_seq(self.current_seq())
     }
 
     /// Returns every live key/value pair as of `snapshot`.
@@ -561,6 +807,8 @@ impl Db {
     }
 
     fn scan_at_seq(&self, snapshot: u64) -> io::Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+        let versions = self.versions();
+
         // Newest level first, and the first version seen for a key wins — the
         // same rule `get_at_seq` follows, applied to a whole level at a time.
         let mut winners: BTreeMap<Vec<u8>, (u64, Entry)> = BTreeMap::new();
@@ -577,10 +825,15 @@ impl Db {
             }
         };
 
-        for (key, entry) in self.memtable.iter() {
+        for (key, entry) in versions.mem.iter() {
             consider(key.user_key.clone(), key.seq, entry.clone());
         }
-        for open in self.tables.iter().rev() {
+        for mem in versions.imm.iter().rev() {
+            for (key, entry) in mem.iter() {
+                consider(key.user_key.clone(), key.seq, entry.clone());
+            }
+        }
+        for open in versions.tables.iter().rev() {
             for item in open.table.iter()? {
                 let (key, seq, entry) = item?;
                 consider(key, seq, entry);
@@ -609,8 +862,8 @@ impl Db {
     }
 
     /// Forces any buffered log data to stable storage.
-    pub fn sync(&mut self) -> io::Result<()> {
-        match self.wal.as_mut() {
+    pub fn sync(&self) -> io::Result<()> {
+        match self.writer().wal.as_mut() {
             Some(wal) => wal.sync(),
             None => Ok(()),
         }
@@ -618,55 +871,77 @@ impl Db {
 
     /// Returns `true` if this store is backed by a write-ahead log.
     pub fn is_durable(&self) -> bool {
-        self.wal.is_some()
+        self.core.dir.is_some()
     }
 
     /// Returns the store's directory, or `None` for an in-memory store.
     pub fn dir(&self) -> Option<&Path> {
-        self.dir.as_deref()
+        self.core.dir.as_deref()
     }
 
     /// Returns the size of the write-ahead log in bytes, or 0 if in-memory.
     pub fn wal_size_bytes(&self) -> u64 {
-        self.wal.as_ref().map_or(0, |w| w.size_bytes())
+        self.writer().wal.as_ref().map_or(0, |w| w.size_bytes())
+    }
+
+    /// Returns the number of fsyncs the log has issued.
+    pub fn wal_syncs(&self) -> u64 {
+        self.writer().wal.as_ref().map_or(0, |w| w.syncs())
     }
 
     /// Approximate resident size of the write buffer, in bytes.
     pub fn size_bytes(&self) -> usize {
-        self.memtable.size_bytes()
+        let versions = self.versions();
+        versions.mem.size_bytes() + versions.imm.iter().map(|m| m.size_bytes()).sum::<usize>()
     }
 
     /// Returns the number of SSTables currently on disk.
     pub fn sstable_count(&self) -> usize {
-        self.tables.len()
+        self.versions().tables.len()
     }
 
-    /// Borrows the on-disk tables, oldest first.
-    pub fn tables(&self) -> Vec<&SsTable> {
-        self.tables.iter().map(|open| &open.table).collect()
+    /// Returns handles to the on-disk tables, oldest first.
+    pub fn tables(&self) -> Vec<Arc<SsTable>> {
+        self.versions()
+            .tables
+            .iter()
+            .map(|open| Arc::clone(&open.table))
+            .collect()
     }
 
     /// Returns the recency slots `(seq, generation)` of the tables on disk,
     /// oldest first.
     pub fn table_slots(&self) -> Vec<(u64, u32)> {
-        self.tables.iter().map(|o| (o.seq, o.generation)).collect()
+        self.versions()
+            .tables
+            .iter()
+            .map(|o| (o.seq, o.generation))
+            .collect()
     }
 
-    /// Borrows the underlying memtable.
-    pub fn memtable(&self) -> &MemTable {
-        &self.memtable
+    /// Returns the memtable currently accepting writes.
+    pub fn memtable(&self) -> Arc<MemTable> {
+        Arc::clone(&self.versions().mem)
     }
 
     /// Returns the store's configured options.
     pub fn options(&self) -> DbOptions {
-        self.options
+        self.core.options
+    }
+
+    /// Returns the number of live handles to this store.
+    pub fn handle_count(&self) -> usize {
+        Arc::strong_count(&self.core)
     }
 }
 
 /// A table on disk together with the recency slot it occupies.
-#[derive(Debug)]
+///
+/// Cheap to clone — the table itself is shared — because publishing a new view
+/// copies the list.
+#[derive(Debug, Clone)]
 struct OpenTable {
-    table: SsTable,
+    table: Arc<SsTable>,
     /// Recency rank. Higher is newer.
     seq: u64,
     /// Generation within a `seq`, bumped each time compaction rewrites the slot.
@@ -719,7 +994,7 @@ fn discover_tables(dir: &Path) -> io::Result<(Vec<OpenTable>, u64)> {
     let mut tables = Vec::with_capacity(found.len());
     for (seq, generation, path) in found {
         tables.push(OpenTable {
-            table: SsTable::open(&path)?,
+            table: Arc::new(SsTable::open(&path)?),
             seq,
             generation,
         });
@@ -748,7 +1023,7 @@ mod tests {
 
     #[test]
     fn basic_put_get_delete_cycle() {
-        let mut db = Db::new();
+        let db = Db::new();
         assert!(db.is_empty().unwrap());
 
         db.put(b"k", b"v").unwrap();
@@ -764,13 +1039,13 @@ mod tests {
 
     #[test]
     fn deleting_an_absent_key_is_a_no_op_for_callers() {
-        let mut db = Db::new();
+        let db = Db::new();
         assert!(!db.delete(b"nope").unwrap());
     }
 
     #[test]
     fn sequence_numbers_increase_by_one_per_mutation() {
-        let mut db = Db::new();
+        let db = Db::new();
         assert_eq!(db.current_seq(), 0);
         db.put(b"a", b"1").unwrap();
         assert_eq!(db.current_seq(), 1);
@@ -782,7 +1057,7 @@ mod tests {
 
     #[test]
     fn a_snapshot_is_unaffected_by_later_writes() {
-        let mut db = Db::new();
+        let db = Db::new();
         db.put(b"k", b"v1").unwrap();
 
         let snap = db.snapshot();
@@ -798,7 +1073,7 @@ mod tests {
 
     #[test]
     fn a_snapshot_taken_before_a_delete_still_reads_the_value() {
-        let mut db = Db::new();
+        let db = Db::new();
         db.put(b"k", b"v").unwrap();
         let snap = db.snapshot();
         db.delete(b"k").unwrap();
@@ -809,7 +1084,7 @@ mod tests {
 
     #[test]
     fn scan_at_a_snapshot_sees_the_state_of_that_moment() {
-        let mut db = Db::new();
+        let db = Db::new();
         db.put(b"a", b"1").unwrap();
         db.put(b"b", b"2").unwrap();
 
@@ -830,7 +1105,7 @@ mod tests {
 
     #[test]
     fn an_in_memory_store_writes_no_log_and_never_flushes() {
-        let mut db = Db::new();
+        let db = Db::new();
         db.put(b"k", b"v").unwrap();
         assert!(!db.is_durable());
         assert_eq!(db.wal_size_bytes(), 0);

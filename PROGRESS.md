@@ -762,3 +762,167 @@ version crosses a *boundary*, since that is where the rule breaks:
   is to not hold snapshots open, and the cost is documented on the type.
 - Version collection runs only at compaction, so a store that never compacts
   never reclaims.
+
+---
+
+## Capability 2 — Non-blocking reads under concurrent writes
+
+**Status:** complete. Build, test, clippy (`-D warnings`), and fmt all clean.
+223 tests pass, up from 207.
+
+### The claim
+
+> **A read never waits on a write, and a read never makes a write wait.**
+
+A reader clones an immutable view of the levels — one `Arc` bump under a lock
+held for nanoseconds — and then does *all* of its work holding nothing: no
+memtable lock, no table-list lock, no writer mutex. Point lookups and range
+scans alike.
+
+### Measured
+
+From `cargo test --test nonblocking_test -- --nocapture` on this machine
+(Apple Silicon, macOS 25.5, **debug build** — these are ratios, not throughput
+claims; real throughput is capability 7):
+
+```
+point reads: 566344 reads and 519 fsynced writes in 2000ms (ratio 1091.2x)
+full scans:  3984 scans and 501 fsynced writes in 2000ms
+under flush/compaction: 522246 reads across 8 flush cycles, 3 tables left
+```
+
+Four reader threads against one writer under `SyncPolicy::EveryWrite`. The
+ratio is the point: if reads queued behind the write path, they would be within
+a small factor of the write rate, because every write pays a disk sync. They are
+three orders of magnitude apart.
+
+### The design, and why this one
+
+Three approaches were considered.
+
+1. **Keep `RwLock<Db>`, just hold it for less time.** Rejected. The lock has to
+   be held across the memtable insert, and the write path's fsync has to happen
+   somewhere; splitting them means readers can observe a write that is not yet
+   durable. It also does not make reads *lock-free*, only *less blocked*, so the
+   claim would have to be hedged.
+2. **Shard the memtable across N `RwLock<BTreeMap>`s.** Rejected for a specific
+   reason: a *range scan* would have to hold read locks on every shard for its
+   whole duration, which blocks writers for as long as the scan runs. Sharding
+   fixes point lookups and breaks scans, and the range iterator is capability 4.
+3. **Make the reader's view immutable, and the memtable insert-only.** Chosen.
+
+What makes (3) work is that MVCC already removed in-place mutation. A delete is
+a tombstone *insert*; an overwrite is a new version *insert*. Nothing is ever
+removed or rewritten — which is exactly the case a lock-free ordered structure
+handles without any reclamation machinery.
+
+So:
+
+- **`src/skiplist.rs` (new)** — a single-writer, many-reader ordered skiplist,
+  12 levels, branching factor 4. Readers traverse with `Acquire` loads and take
+  no lock. The writer publishes each forward pointer with a `Release` store.
+- **`Versions`** — an immutable value holding the active memtable, the frozen
+  memtables awaiting flush, and the table list. Flush and compaction build a new
+  one and swap the pointer; a reader that already cloned the old one keeps using
+  it, consistently, until it finishes.
+- **`Db` became a cloneable handle** — `Arc<Core>`, `Clone + Send + Sync`, every
+  method `&self`.
+
+### Key design decisions, and why
+
+**Single-writer, not multi-writer, and deliberately so.** A multi-writer
+lock-free skiplist needs a CAS retry loop at every level and has genuinely hard
+memory-reclamation questions. With one writer, linking a node is a plain store
+and the only thing that must be right is *ordering*. Writers were already
+serialized by the log anyway, so this costs nothing that was not already spent —
+and group commit (capability 3) turns that serialization from a bottleneck into
+the mechanism that amortizes fsyncs.
+
+**`SkipList::insert` is `unsafe`.** The single-writer requirement is a real
+obligation the type cannot check, so it is stated as one rather than hidden.
+`insert_exclusive` is the safe form for `&mut self` callers, where the borrow
+checker proves it. The store discharges the obligation with the write mutex it
+already holds.
+
+**Nodes are linked bottom level first.** A reader scanning an upper level may
+miss a node not yet linked there — harmless, because it descends and finds it at
+level 0. The reverse order *is* the bug: a node reachable at level 3 but not at
+level 0 would be skipped by every scan that descends past it.
+
+**No epoch or hazard-pointer reclamation, because none is needed.** Nodes are
+never freed while the list is alive; the whole list is freed at once in `Drop`,
+which takes `&mut self` and so cannot race a reader. Lifetime is `Arc`: readers
+hold an `Arc<MemTable>` and the allocation outlives the last of them. This is
+absence-by-argument, not absence-by-omission.
+
+**Flush freezes rather than clears.** The old code cleared the memtable in place.
+Under an `Arc` that would mutate a structure readers are holding. Now flush moves
+the active memtable into `imm`, installs a fresh one, writes `imm` to disk
+holding *no* view lock, and only then retires it. Readers searching `imm` see the
+data throughout — nothing disappears mid-flight.
+
+**Compaction unlinks input files while readers may still hold them.** Safe on
+Unix, where an open descriptor keeps an unlinked file readable, which is why
+`SsTable` holds its descriptor open (added in capability 1 for exactly this).
+Documented as a Unix-only guarantee on the type; on Windows the unlink itself
+would fail.
+
+**Poisoning is recovered from, not propagated.** The write mutex guards a log
+handle and an insert-only memtable, neither of which has an invariant spanning
+operations, so a panicking writer cannot leave a half-updated structure behind.
+The old behaviour — poison the `RwLock`, fail every subsequent call forever — is
+gone, and there is a test asserting a panicking writer's own acknowledged write
+survives and the store keeps taking traffic.
+
+### A real bug this work surfaced
+
+The first version of `SsTableIter` used `BufReader` over `self.file.try_clone()`.
+`try_clone` is `dup(2)` on Unix, and **duplicated descriptors share one file
+offset** — so two iterators over the same table, or an iterator racing a point
+lookup, moved each other's cursor and read garbage. It showed up as
+`UnexpectedEof` in the concurrent-scan test and would never have appeared in a
+single-threaded one.
+
+Fixed by giving the iterator its own buffer and reading positionally (`pread`),
+which takes the offset as an argument and never touches the shared cursor. The
+comment on the type says all of this, because the wrong version looks more
+idiomatic than the right one.
+
+### What is tested
+
+5 new integration tests in `tests/nonblocking_test.rs`, plus 8 unit tests in
+`skiplist.rs`. The shape matters: "it didn't crash" is not evidence, so each
+concurrency test asserts something a blocked reader would fail.
+
+- **Reads complete continuously.** The run is divided into 100 ms buckets and
+  *every* bucket must contain completed reads. A reader that stalls behind an
+  fsync leaves a hole, and the failure message prints the per-bucket histogram.
+- **Reads out-rate fsynced writes by more than 5×** (measured: 1091×). Asserted
+  with a wide margin so this stays a structural check, not a speed test.
+- The same two properties **while flushes and compactions run** (8 flush cycles
+  within the window), which is where the old design held its lock longest.
+- **Full scans** keep completing under a hammering writer, *and* the writer keeps
+  progressing — the reverse direction, since a long scan is where a
+  reader-blocks-writer design shows up worst.
+- **No invented values**: 3 writers cycle 50 keys through 64 known values while 4
+  readers assert every value read was one somebody wrote.
+- **A snapshot stays stable under load**: an open snapshot resolves to the same
+  value across thousands of reads while the levels beneath it are rewritten by
+  flushes and compactions.
+- Skiplist units: ordering under shuffled insert, seek semantics at and between
+  versions, `iter_from` positioning, level promotion past height 1, and a
+  4-reader/1-writer stress asserting iteration order never breaks mid-insert.
+
+### Known limitations (deliberate)
+
+- **Writers are still serialized with each other.** One log, one memtable
+  writer. Capability 3 makes that pay for itself rather than removing it.
+- **Flush and compaction hold the writer mutex**, so a large merge stalls
+  *writes*. It does not stall reads, which is the claim being made. Background
+  compaction remains unbuilt.
+- **Concurrent compaction is Unix-only**, per the unlink-while-open argument.
+- `scan`/`len` still materialize. Capability 4.
+- `SharedDb` is now redundant — `Db` is itself the thread-safe handle. It is kept
+  as a thin wrapper because it is a published API, and its `read()`/`write()`
+  guard accessors are gone: there is no `RwLock<Db>` left to guard, and
+  `Db::snapshot` does what they were reaching for, without blocking anyone.

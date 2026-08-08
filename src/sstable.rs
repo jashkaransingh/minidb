@@ -68,7 +68,7 @@
 //! new name itself is not durable.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::bloom::{BloomFilter, DEFAULT_FP_RATE, hash_pair};
@@ -686,9 +686,10 @@ impl SsTable {
         // first visible version. In practice this reads exactly one block.
         for block in &self.index[self.start_block(key, snapshot)..] {
             let buf = self.read_block(block)?;
-            let mut cursor = &buf[..];
-            while !cursor.is_empty() {
-                let (_, k, seq, entry) = read_entry(&mut cursor)?;
+            let mut cursor = 0usize;
+            while cursor < buf.len() {
+                let (consumed, k, seq, entry) = decode_entry(&buf[cursor..])?;
+                cursor += consumed;
                 match k.as_slice().cmp(key) {
                     std::cmp::Ordering::Less => continue,
                     // Data is sorted, so passing the target ends the search.
@@ -781,12 +782,17 @@ impl SsTable {
             }
             _ => 0,
         };
-        let mut file = self.file.try_clone()?;
-        file.seek(SeekFrom::Start(offset))?;
         Ok(SsTableIter {
-            reader: BufReader::new(file),
-            remaining: self.footer.data_len.saturating_sub(offset),
-            done: false,
+            // A dup'd descriptor, not a fresh open: the file may already have
+            // been unlinked by a compaction, and only an existing descriptor
+            // still reaches it. The dup *shares the file offset* with every
+            // other clone, which is why this iterator never seeks or reads
+            // sequentially — it uses positional reads with an offset of its own.
+            file: self.file.try_clone()?,
+            next_offset: offset,
+            end_offset: self.footer.data_len,
+            buf: Vec::new(),
+            pos: 0,
         })
     }
 
@@ -872,12 +878,106 @@ impl SsTable {
     }
 }
 
+/// Decodes one data entry from the front of `buf`.
+///
+/// Returns the bytes consumed alongside the decoded key, sequence, and entry.
+fn decode_entry(buf: &[u8]) -> io::Result<(usize, Vec<u8>, u64, Entry)> {
+    if buf.len() < ENTRY_HEADER_LEN {
+        return Err(corrupt("SSTable entry header is truncated"));
+    }
+    let kind = buf[0];
+    let seq = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+    let key_len = u32::from_le_bytes(buf[9..13].try_into().unwrap()) as usize;
+    let value_len = u32::from_le_bytes(buf[13..17].try_into().unwrap()) as usize;
+
+    let total = ENTRY_HEADER_LEN + key_len + value_len;
+    if buf.len() < total {
+        return Err(corrupt("SSTable entry runs past its block"));
+    }
+
+    let key = buf[ENTRY_HEADER_LEN..ENTRY_HEADER_LEN + key_len].to_vec();
+    let entry = match kind {
+        KIND_VALUE => Entry::Value(buf[ENTRY_HEADER_LEN + key_len..total].to_vec()),
+        KIND_TOMBSTONE => Entry::Tombstone,
+        other => return Err(corrupt(&format!("unknown SSTable entry kind {other}"))),
+    };
+    Ok((total, key, seq, entry))
+}
+
+/// Bytes pulled from disk per refill while iterating.
+const ITER_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Sequential iterator over a table's data section.
+///
+/// # Why it does its own buffering
+///
+/// The obvious implementation — `BufReader` over a cloned `File` — is wrong
+/// here, and silently so. `File::try_clone` is `dup(2)` on Unix, and duplicated
+/// descriptors **share one file offset**. Two iterators over the same table, or
+/// an iterator running alongside a point lookup, would move each other's cursor
+/// and read garbage. It surfaces as `UnexpectedEof` or a corrupt-entry error
+/// under concurrency and not at all in a single-threaded test.
+///
+/// So this reads positionally — `pread`, which takes the offset as an argument
+/// and never touches the shared cursor — into a buffer it owns.
 #[derive(Debug)]
 pub struct SsTableIter {
-    reader: BufReader<File>,
-    remaining: u64,
-    done: bool,
+    file: File,
+    /// Next file offset to read from.
+    next_offset: u64,
+    /// End of the data section.
+    end_offset: u64,
+    /// Bytes read but not yet consumed.
+    buf: Vec<u8>,
+    /// Consumed prefix of `buf`.
+    pos: usize,
+}
+
+impl SsTableIter {
+    /// Ensures at least `need` unconsumed bytes are buffered.
+    ///
+    /// Returns `false` when the data section is exhausted before that.
+    fn ensure(&mut self, need: usize) -> io::Result<bool> {
+        if self.buf.len() - self.pos >= need {
+            return Ok(true);
+        }
+        // Drop the consumed prefix rather than growing without bound.
+        self.buf.drain(..self.pos);
+        self.pos = 0;
+
+        while self.buf.len() < need {
+            let remaining = self.end_offset.saturating_sub(self.next_offset);
+            if remaining == 0 {
+                return Ok(false);
+            }
+            let want = (ITER_CHUNK_BYTES.max(need) as u64).min(remaining) as usize;
+            let start = self.buf.len();
+            self.buf.resize(start + want, 0);
+            read_exact_at(&self.file, &mut self.buf[start..], self.next_offset)?;
+            self.next_offset += want as u64;
+        }
+        Ok(true)
+    }
+
+    /// Decodes the next entry, or `Ok(None)` at the end of the data section.
+    fn read_next(&mut self) -> io::Result<Option<(Vec<u8>, u64, Entry)>> {
+        if !self.ensure(ENTRY_HEADER_LEN)? {
+            return Ok(None);
+        }
+        // The header is buffered; read the two lengths so the whole entry can
+        // be pulled in before it is decoded.
+        let header = &self.buf[self.pos..self.pos + ENTRY_HEADER_LEN];
+        let key_len = u32::from_le_bytes(header[9..13].try_into().unwrap()) as usize;
+        let value_len = u32::from_le_bytes(header[13..17].try_into().unwrap()) as usize;
+        let total = ENTRY_HEADER_LEN + key_len + value_len;
+
+        if !self.ensure(total)? {
+            return Err(corrupt("SSTable entry runs past the data section"));
+        }
+        let (consumed, key, seq, entry) = decode_entry(&self.buf[self.pos..self.pos + total])?;
+        self.pos += consumed;
+        Ok(Some((key, seq, entry)))
+    }
 }
 
 impl Iterator for SsTableIter {
@@ -885,48 +985,18 @@ impl Iterator for SsTableIter {
     type Item = io::Result<(Vec<u8>, u64, Entry)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done || self.remaining == 0 {
-            return None;
-        }
-
-        match read_entry(&mut self.reader) {
-            Ok((consumed, key, seq, entry)) => {
-                self.remaining = self.remaining.saturating_sub(consumed);
-                Some(Ok((key, seq, entry)))
-            }
+        match self.read_next() {
+            Ok(Some(item)) => Some(Ok(item)),
+            Ok(None) => None,
             Err(e) => {
-                self.done = true;
+                // Stop rather than spin on a broken table.
+                self.end_offset = self.next_offset;
+                self.buf.clear();
+                self.pos = 0;
                 Some(Err(e))
             }
         }
     }
-}
-
-/// Reads one data entry, returning the bytes consumed alongside the entry.
-fn read_entry<R: Read>(reader: &mut R) -> io::Result<(u64, Vec<u8>, u64, Entry)> {
-    let mut header = [0u8; ENTRY_HEADER_LEN];
-    reader.read_exact(&mut header)?;
-
-    let kind = header[0];
-    let seq = u64::from_le_bytes(header[1..9].try_into().unwrap());
-    let key_len = u32::from_le_bytes(header[9..13].try_into().unwrap()) as usize;
-    let value_len = u32::from_le_bytes(header[13..17].try_into().unwrap()) as usize;
-
-    let mut key = vec![0u8; key_len];
-    reader.read_exact(&mut key)?;
-
-    let entry = match kind {
-        KIND_VALUE => {
-            let mut value = vec![0u8; value_len];
-            reader.read_exact(&mut value)?;
-            Entry::Value(value)
-        }
-        KIND_TOMBSTONE => Entry::Tombstone,
-        other => return Err(corrupt(&format!("unknown SSTable entry kind {other}"))),
-    };
-
-    let consumed = (ENTRY_HEADER_LEN + key_len + value_len) as u64;
-    Ok((consumed, key, seq, entry))
 }
 
 /// Reads exactly `buf.len()` bytes from `offset` without moving the file cursor.

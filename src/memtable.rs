@@ -30,11 +30,22 @@
 //! snapshot. One seek, no scanning past invisible versions. See
 //! [`MemTable::get`].
 //!
-//! Backed by a `BTreeMap`, so keys stay in sorted order: the eventual flush is a
-//! single sequential write and range scans are a straight walk.
+//! # Why a skiplist and not a `BTreeMap`
+//!
+//! Keys must stay sorted — the flush is a single sequential write and range
+//! scans are a straight walk — but a `BTreeMap` also forces every reader to take
+//! a lock, and in this store a writer holds its lock across an fsync. Readers
+//! would stall on the disk.
+//!
+//! [`crate::skiplist::SkipList`] is an insert-only, single-writer ordered list
+//! whose reads are lock-free pointer chasing. Insert-only is not a restriction
+//! here: under MVCC a delete is a tombstone *insert* and an overwrite is a new
+//! version *insert*, so nothing is ever removed or mutated in place, which is
+//! exactly the case a lock-free structure handles without reclamation
+//! machinery. The single-writer restriction is discharged by the store's write
+//! mutex, which mutations already hold to serialize log appends.
 
-use std::collections::BTreeMap;
-use std::ops::Bound;
+use crate::skiplist::SkipList;
 
 /// A value slot in the memtable.
 ///
@@ -141,22 +152,21 @@ pub fn compare_internal(a_key: &[u8], a_seq: u64, b_key: &[u8], b_seq: u64) -> s
 
 /// Sorted in-memory write buffer, holding every version written since the last
 /// flush.
+///
+/// Reads take no lock. Writes require exclusive access — either statically, via
+/// `&mut self` on [`insert`](Self::insert), or dynamically, via the `unsafe`
+/// [`insert_shared`](Self::insert_shared) for callers that hold the store's
+/// write mutex and reach the memtable through an `Arc`.
 #[derive(Debug, Default)]
 pub struct MemTable {
-    map: BTreeMap<InternalKey, Entry>,
-    /// Approximate heap footprint of stored keys and values, in bytes.
-    size_bytes: usize,
-    /// Highest sequence number inserted, or 0 if empty.
-    max_seq: u64,
+    list: SkipList,
 }
 
 impl MemTable {
     /// Creates an empty memtable.
     pub fn new() -> Self {
         Self {
-            map: BTreeMap::new(),
-            size_bytes: 0,
-            max_seq: 0,
+            list: SkipList::new(),
         }
     }
 
@@ -167,9 +177,26 @@ impl MemTable {
     /// *is* under MVCC — the old version stays readable by older snapshots
     /// until compaction collects it.
     pub fn insert(&mut self, key: &[u8], seq: u64, entry: Entry) {
-        self.size_bytes += key.len() + 8 + entry.len();
-        self.max_seq = self.max_seq.max(seq);
-        self.map.insert(InternalKey::new(key.to_vec(), seq), entry);
+        self.list
+            .insert_exclusive(InternalKey::new(key.to_vec(), seq), entry);
+    }
+
+    /// Records `entry` through a shared reference.
+    ///
+    /// # Safety
+    ///
+    /// **At most one thread may be inside this function at a time.** Concurrent
+    /// readers are fine — that is the point of the structure — but two
+    /// concurrent writers would corrupt it.
+    ///
+    /// In minidb this is discharged by the store's write mutex, which every
+    /// mutation holds anyway to serialize log appends. Reaching the memtable
+    /// through an `Arc` is what lets readers hold it without a lock, so the
+    /// exclusivity cannot be proven by the borrow checker and has to be an
+    /// obligation instead.
+    pub unsafe fn insert_shared(&self, key: &[u8], seq: u64, entry: Entry) {
+        // SAFETY: forwarded to the caller.
+        unsafe { self.list.insert(InternalKey::new(key.to_vec(), seq), entry) }
     }
 
     /// Convenience wrapper: writes a value at `seq`.
@@ -194,8 +221,7 @@ impl MemTable {
     /// newest visible version, so the first entry at or after it is the answer —
     /// provided it still belongs to `key`.
     pub fn get(&self, key: &[u8], snapshot: u64) -> Option<&Entry> {
-        let probe = InternalKey::probe(key, snapshot);
-        let (found, entry) = self.map.range(probe..).next()?;
+        let (found, entry) = self.list.seek(&InternalKey::probe(key, snapshot))?;
         if found.user_key == key {
             Some(entry)
         } else {
@@ -207,24 +233,24 @@ impl MemTable {
 
     /// Returns the number of stored versions, tombstones included.
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.list.len()
     }
 
     /// Returns `true` if the memtable holds no entries at all.
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.list.is_empty()
     }
 
     /// Returns the approximate heap footprint of the stored data, in bytes.
     ///
     /// Used to decide when to freeze this memtable and flush it to an SSTable.
     pub fn size_bytes(&self) -> usize {
-        self.size_bytes
+        self.list.size_bytes()
     }
 
     /// Returns the highest sequence number stored, or 0 if empty.
     pub fn max_seq(&self) -> u64 {
-        self.max_seq
+        self.list.max_seq()
     }
 
     /// Iterates over every version in internal-key order — user key ascending,
@@ -233,7 +259,7 @@ impl MemTable {
     /// This is the flush path: an SSTable writer consumes this stream directly,
     /// which is why the on-disk ordering has to match this one exactly.
     pub fn iter(&self) -> impl Iterator<Item = (&InternalKey, &Entry)> {
-        self.map.iter()
+        self.list.iter()
     }
 
     /// Iterates over versions whose user key falls in `[start, end)`.
@@ -246,24 +272,18 @@ impl MemTable {
         start: &[u8],
         end: Option<&[u8]>,
     ) -> impl Iterator<Item = (&'a InternalKey, &'a Entry)> {
-        // The lower bound uses seq = u64::MAX because that sorts before every
-        // real version of `start` (seq descends), so no version of the start key
-        // is skipped.
-        let lower = Bound::Included(InternalKey::new(start.to_vec(), u64::MAX));
-        let upper = match end {
-            // Likewise u64::MAX for the exclusive upper bound: it sorts before
-            // every version of `end`, so `end` itself is excluded entirely.
-            Some(e) => Bound::Excluded(InternalKey::new(e.to_vec(), u64::MAX)),
-            None => Bound::Unbounded,
-        };
-        self.map.range((lower, upper))
-    }
-
-    /// Removes all entries.
-    pub fn clear(&mut self) {
-        self.map.clear();
-        self.size_bytes = 0;
-        self.max_seq = 0;
+        // Both bounds use seq = u64::MAX because that sorts before every real
+        // version of a key (sequence numbers descend): the lower bound therefore
+        // skips no version of `start`, and the upper bound excludes `end`
+        // entirely rather than admitting its newest version.
+        let lower = InternalKey::new(start.to_vec(), u64::MAX);
+        let upper = end.map(|e| InternalKey::new(e.to_vec(), u64::MAX));
+        self.list
+            .iter_from(&lower)
+            .take_while(move |(k, _)| match &upper {
+                Some(limit) => *k < limit,
+                None => true,
+            })
     }
 }
 
@@ -476,10 +496,11 @@ mod tests {
     }
 
     #[test]
-    fn clear_empties_the_table() {
-        let mut t = MemTable::new();
-        put(&mut t, "a", 1, "1");
-        t.clear();
+    fn a_fresh_memtable_starts_empty() {
+        // A flush installs a new memtable rather than clearing the old one:
+        // readers may still be holding the old one through an `Arc`, and
+        // mutating it under them is exactly what this design rules out.
+        let t = MemTable::new();
         assert!(t.is_empty());
         assert_eq!(t.size_bytes(), 0);
         assert_eq!(t.max_seq(), 0);

@@ -62,7 +62,7 @@ impl Drop for TempStore {
 #[test]
 fn an_explicit_flush_writes_a_table_and_empties_the_memtable() {
     let store = TempStore::new("explicit");
-    let mut db = store.open(usize::MAX); // never auto-flush
+    let db = store.open(usize::MAX); // never auto-flush
 
     db.put(b"a", b"1").unwrap();
     db.put(b"b", b"2").unwrap();
@@ -81,7 +81,7 @@ fn an_explicit_flush_writes_a_table_and_empties_the_memtable() {
 #[test]
 fn flushing_an_empty_memtable_is_a_no_op() {
     let store = TempStore::new("empty-flush");
-    let mut db = store.open(usize::MAX);
+    let db = store.open(usize::MAX);
     assert_eq!(db.flush().unwrap(), None);
     assert_eq!(db.sstable_count(), 0);
 }
@@ -89,7 +89,7 @@ fn flushing_an_empty_memtable_is_a_no_op() {
 #[test]
 fn the_wal_is_rotated_once_its_data_is_safely_in_a_table() {
     let store = TempStore::new("rotate");
-    let mut db = store.open(usize::MAX);
+    let db = store.open(usize::MAX);
 
     db.put(b"a", b"1").unwrap();
     assert!(db.wal_size_bytes() > 0);
@@ -107,7 +107,7 @@ fn the_wal_is_rotated_once_its_data_is_safely_in_a_table() {
 #[test]
 fn writes_past_the_threshold_flush_automatically() {
     let store = TempStore::new("auto");
-    let mut db = store.open(64); // tiny threshold
+    let db = store.open(64); // tiny threshold
 
     for i in 0..100u32 {
         db.put(format!("key:{i:04}").as_bytes(), b"payload-value")
@@ -135,7 +135,7 @@ fn writes_past_the_threshold_flush_automatically() {
 #[test]
 fn a_newer_table_shadows_an_older_one() {
     let store = TempStore::new("shadow");
-    let mut db = store.open(usize::MAX);
+    let db = store.open(usize::MAX);
 
     db.put(b"k", b"old").unwrap();
     db.flush().unwrap();
@@ -151,7 +151,7 @@ fn a_newer_table_shadows_an_older_one() {
 #[test]
 fn a_tombstone_in_a_newer_table_hides_a_value_in_an_older_one() {
     let store = TempStore::new("tombstone-shadow");
-    let mut db = store.open(usize::MAX);
+    let db = store.open(usize::MAX);
 
     db.put(b"doomed", b"value").unwrap();
     db.put(b"kept", b"value").unwrap();
@@ -173,7 +173,7 @@ fn a_tombstone_in_a_newer_table_hides_a_value_in_an_older_one() {
 #[test]
 fn a_delete_then_rewrite_across_flushes_resolves_to_the_newest_value() {
     let store = TempStore::new("resurrect");
-    let mut db = store.open(usize::MAX);
+    let db = store.open(usize::MAX);
 
     db.put(b"phoenix", b"first").unwrap();
     db.flush().unwrap();
@@ -189,7 +189,7 @@ fn a_delete_then_rewrite_across_flushes_resolves_to_the_newest_value() {
 #[test]
 fn the_memtable_shadows_every_table_beneath_it() {
     let store = TempStore::new("memtable-wins");
-    let mut db = store.open(usize::MAX);
+    let db = store.open(usize::MAX);
 
     db.put(b"k", b"on-disk").unwrap();
     db.flush().unwrap();
@@ -209,7 +209,7 @@ fn the_memtable_shadows_every_table_beneath_it() {
 fn tables_are_rediscovered_when_the_store_is_reopened() {
     let store = TempStore::new("rediscover");
     {
-        let mut db = store.open(usize::MAX);
+        let db = store.open(usize::MAX);
         db.put(b"a", b"1").unwrap();
         db.flush().unwrap();
         db.put(b"b", b"2").unwrap();
@@ -229,7 +229,7 @@ fn tables_are_rediscovered_when_the_store_is_reopened() {
 fn table_shadowing_order_survives_a_reopen() {
     let store = TempStore::new("order-survives");
     {
-        let mut db = store.open(usize::MAX);
+        let db = store.open(usize::MAX);
         db.put(b"k", b"v1").unwrap();
         db.flush().unwrap();
         db.put(b"k", b"v2").unwrap();
@@ -251,12 +251,12 @@ fn table_shadowing_order_survives_a_reopen() {
 fn sequence_numbers_continue_after_a_reopen() {
     let store = TempStore::new("seq");
     {
-        let mut db = store.open(usize::MAX);
+        let db = store.open(usize::MAX);
         db.put(b"a", b"1").unwrap();
         db.flush().unwrap();
     }
     {
-        let mut db = store.open(usize::MAX);
+        let db = store.open(usize::MAX);
         db.put(b"b", b"2").unwrap();
         db.flush().unwrap();
     }
@@ -269,7 +269,7 @@ fn sequence_numbers_continue_after_a_reopen() {
 fn a_stale_temp_file_is_cleaned_up_on_open() {
     let store = TempStore::new("stale-tmp");
     {
-        let mut db = store.open(usize::MAX);
+        let db = store.open(usize::MAX);
         db.put(b"a", b"1").unwrap();
         db.flush().unwrap();
     }
@@ -288,7 +288,7 @@ fn a_stale_temp_file_is_cleaned_up_on_open() {
 fn data_written_before_a_flush_survives_a_simulated_crash_after_it() {
     let store = TempStore::new("crash-after-flush");
     {
-        let mut db = store.open(usize::MAX);
+        let db = store.open(usize::MAX);
         db.put(b"flushed", b"1").unwrap();
         db.flush().unwrap();
         // Written after the flush: lives only in the log.
@@ -304,7 +304,7 @@ fn data_written_before_a_flush_survives_a_simulated_crash_after_it() {
 #[test]
 fn a_bulk_workload_stays_consistent_across_many_flushes() {
     let store = TempStore::new("bulk");
-    let mut db = store.open(256);
+    let db = store.open(256);
 
     // Write 600 keys, then overwrite a third and delete another third.
     for i in 0..600u32 {
@@ -341,7 +341,7 @@ fn a_bulk_workload_stays_consistent_across_many_flushes() {
 #[test]
 fn scan_returns_the_merged_live_view() {
     let store = TempStore::new("scan");
-    let mut db = store.open(usize::MAX);
+    let db = store.open(usize::MAX);
 
     db.put(b"a", b"1").unwrap();
     db.put(b"b", b"2").unwrap();
@@ -368,7 +368,7 @@ fn scan_returns_the_merged_live_view() {
 #[test]
 fn flushed_tables_carry_usable_metadata() {
     let store = TempStore::new("meta");
-    let mut db = store.open(usize::MAX);
+    let db = store.open(usize::MAX);
 
     db.put(b"apple", b"1").unwrap();
     db.put(b"mango", b"2").unwrap();
