@@ -1,13 +1,40 @@
-//! In-memory sorted table.
+//! In-memory sorted table, keyed by *internal key*.
 //!
 //! The memtable is the write buffer at the top of the LSM tree. All writes land
 //! here first (after being appended to the WAL for durability). Once it exceeds
 //! a size threshold it is frozen and flushed to disk as an immutable SSTable.
 //!
-//! Backed by a `BTreeMap` so keys stay in sorted order, which makes the eventual
-//! flush a single sequential write and makes range scans cheap.
+//! # Internal keys and MVCC
+//!
+//! Every mutation carries a monotonically increasing **sequence number**, and the
+//! memtable is keyed by [`InternalKey`] — the pair `(user_key, seq)` — rather
+//! than by the user key alone. An overwrite therefore *adds* a version instead
+//! of replacing one, which is what makes point-in-time snapshot reads possible.
+//!
+//! The ordering is the whole trick:
+//!
+//! ```text
+//! user_key ascending, then seq DESCENDING
+//! ```
+//!
+//! so all versions of one key are adjacent and run newest-first:
+//!
+//! ```text
+//! ("apple", 9) ("apple", 4) ("apple", 1) ("banana", 7) ("banana", 2) …
+//! ```
+//!
+//! A read at snapshot `S` seeks to the synthetic key `(user_key, S)`. Because
+//! seq sorts descending, every version *newer* than `S` sorts strictly before
+//! that probe and every version at or older than `S` sorts at or after it — so
+//! the very first entry the seek lands on is the newest version visible to the
+//! snapshot. One seek, no scanning past invisible versions. See
+//! [`MemTable::get`].
+//!
+//! Backed by a `BTreeMap`, so keys stay in sorted order: the eventual flush is a
+//! single sequential write and range scans are a straight walk.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
 /// A value slot in the memtable.
 ///
@@ -22,12 +49,105 @@ pub enum Entry {
     Tombstone,
 }
 
-/// Sorted in-memory write buffer.
+impl Entry {
+    /// Returns the value, or `None` for a tombstone.
+    pub fn value(&self) -> Option<&[u8]> {
+        match self {
+            Entry::Value(v) => Some(v),
+            Entry::Tombstone => None,
+        }
+    }
+
+    /// Returns `true` if this entry is a deletion marker.
+    pub fn is_tombstone(&self) -> bool {
+        matches!(self, Entry::Tombstone)
+    }
+
+    /// Bytes of payload this entry holds.
+    pub fn len(&self) -> usize {
+        match self {
+            Entry::Value(v) => v.len(),
+            Entry::Tombstone => 0,
+        }
+    }
+
+    /// Returns `true` if this entry carries no payload bytes.
+    ///
+    /// Note that an empty *value* is a real value, distinct from a tombstone —
+    /// this reports only the byte count.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A user key paired with the sequence number of the write that produced it.
+///
+/// The `Ord` implementation is load-bearing: **user key ascending, sequence
+/// number descending**. Versions of one key are therefore contiguous and ordered
+/// newest-first, which turns "find the newest version visible at snapshot `S`"
+/// into a single seek to `(user_key, S)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InternalKey {
+    pub user_key: Vec<u8>,
+    pub seq: u64,
+}
+
+impl InternalKey {
+    /// Builds an internal key.
+    pub fn new(user_key: impl Into<Vec<u8>>, seq: u64) -> Self {
+        Self {
+            user_key: user_key.into(),
+            seq,
+        }
+    }
+
+    /// The probe key for reading `user_key` at snapshot `snapshot`.
+    ///
+    /// Sorts at or before every version of `user_key` with `seq <= snapshot`,
+    /// and strictly after every version with `seq > snapshot`.
+    pub fn probe(user_key: &[u8], snapshot: u64) -> Self {
+        Self {
+            user_key: user_key.to_vec(),
+            seq: snapshot,
+        }
+    }
+
+    /// Approximate heap footprint, in bytes.
+    pub fn size_bytes(&self) -> usize {
+        self.user_key.len() + 8
+    }
+}
+
+impl Ord for InternalKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // User key ascending, then sequence number DESCENDING so the newest
+        // version of a key sorts first.
+        self.user_key
+            .cmp(&other.user_key)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+impl PartialOrd for InternalKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Compares two internal keys given as their parts, without allocating.
+pub fn compare_internal(a_key: &[u8], a_seq: u64, b_key: &[u8], b_seq: u64) -> std::cmp::Ordering {
+    a_key.cmp(b_key).then_with(|| b_seq.cmp(&a_seq))
+}
+
+/// Sorted in-memory write buffer, holding every version written since the last
+/// flush.
 #[derive(Debug, Default)]
 pub struct MemTable {
-    map: BTreeMap<Vec<u8>, Entry>,
-    /// Approximate heap footprint of live keys and values, in bytes.
+    map: BTreeMap<InternalKey, Entry>,
+    /// Approximate heap footprint of stored keys and values, in bytes.
     size_bytes: usize,
+    /// Highest sequence number inserted, or 0 if empty.
+    max_seq: u64,
 }
 
 impl MemTable {
@@ -36,50 +156,56 @@ impl MemTable {
         Self {
             map: BTreeMap::new(),
             size_bytes: 0,
+            max_seq: 0,
         }
     }
 
-    /// Inserts or overwrites `key` with `value`.
-    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        let added = key.len() + value.len();
-        if let Some(old) = self.map.insert(key.clone(), Entry::Value(value)) {
-            self.size_bytes -= key.len() + entry_len(&old);
-        }
-        self.size_bytes += added;
-    }
-
-    /// Returns the value for `key`, or `None` if it is absent or deleted.
-    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        match self.map.get(key) {
-            Some(Entry::Value(v)) => Some(v),
-            Some(Entry::Tombstone) | None => None,
-        }
-    }
-
-    /// Marks `key` as deleted by writing a tombstone.
+    /// Records `entry` for `key` at sequence number `seq`.
     ///
-    /// Returns `true` if a live value was shadowed by this call.
-    pub fn delete(&mut self, key: Vec<u8>) -> bool {
-        let existed = matches!(self.map.get(&key), Some(Entry::Value(_)));
-        let key_len = key.len();
-        if let Some(old) = self.map.insert(key, Entry::Tombstone) {
-            self.size_bytes -= entry_len(&old);
+    /// This never replaces an existing entry: sequence numbers are unique per
+    /// mutation, so each call adds a new version. That is what an overwrite
+    /// *is* under MVCC — the old version stays readable by older snapshots
+    /// until compaction collects it.
+    pub fn insert(&mut self, key: &[u8], seq: u64, entry: Entry) {
+        self.size_bytes += key.len() + 8 + entry.len();
+        self.max_seq = self.max_seq.max(seq);
+        self.map.insert(InternalKey::new(key.to_vec(), seq), entry);
+    }
+
+    /// Convenience wrapper: writes a value at `seq`.
+    pub fn put(&mut self, key: &[u8], seq: u64, value: Vec<u8>) {
+        self.insert(key, seq, Entry::Value(value));
+    }
+
+    /// Convenience wrapper: writes a tombstone at `seq`.
+    pub fn delete(&mut self, key: &[u8], seq: u64) {
+        self.insert(key, seq, Entry::Tombstone);
+    }
+
+    /// Returns the newest version of `key` visible at `snapshot`.
+    ///
+    /// `None` means this memtable holds no version of `key` at or below
+    /// `snapshot` — the caller must keep searching older levels.
+    /// `Some(Entry::Tombstone)` means the key was deleted at or below the
+    /// snapshot, and the search must **stop** rather than fall through to a
+    /// stale value on disk.
+    ///
+    /// Implemented as one seek: `(key, snapshot)` sorts immediately before the
+    /// newest visible version, so the first entry at or after it is the answer —
+    /// provided it still belongs to `key`.
+    pub fn get(&self, key: &[u8], snapshot: u64) -> Option<&Entry> {
+        let probe = InternalKey::probe(key, snapshot);
+        let (found, entry) = self.map.range(probe..).next()?;
+        if found.user_key == key {
+            Some(entry)
         } else {
-            self.size_bytes += key_len;
+            // The seek ran off the end of this key's versions, so every version
+            // of `key` here is newer than the snapshot.
+            None
         }
-        existed
     }
 
-    /// Returns the raw entry for `key`, including tombstones.
-    ///
-    /// Reads that fall through to lower levels need to distinguish "deleted
-    /// here" from "not present here" — the first stops the search, the second
-    /// continues it. [`get`](Self::get) collapses both to `None`.
-    pub fn get_entry(&self, key: &[u8]) -> Option<&Entry> {
-        self.map.get(key)
-    }
-
-    /// Returns the number of entries, counting tombstones.
+    /// Returns the number of stored versions, tombstones included.
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -96,32 +222,48 @@ impl MemTable {
         self.size_bytes
     }
 
-    /// Iterates over every entry in ascending key order, tombstones included.
+    /// Returns the highest sequence number stored, or 0 if empty.
+    pub fn max_seq(&self) -> u64 {
+        self.max_seq
+    }
+
+    /// Iterates over every version in internal-key order — user key ascending,
+    /// sequence number descending — tombstones included.
     ///
-    /// This is the flush path: an SSTable writer consumes this stream directly.
-    pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &Entry)> {
+    /// This is the flush path: an SSTable writer consumes this stream directly,
+    /// which is why the on-disk ordering has to match this one exactly.
+    pub fn iter(&self) -> impl Iterator<Item = (&InternalKey, &Entry)> {
         self.map.iter()
     }
 
-    /// Iterates over live key/value pairs in ascending key order.
-    pub fn iter_values(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        self.map.iter().filter_map(|(k, e)| match e {
-            Entry::Value(v) => Some((k.as_slice(), v.as_slice())),
-            Entry::Tombstone => None,
-        })
+    /// Iterates over versions whose user key falls in `[start, end)`.
+    ///
+    /// `end` of `None` means unbounded. Ordering is the same internal-key order
+    /// as [`iter`](Self::iter), so all versions of a key arrive together,
+    /// newest first.
+    pub fn range<'a>(
+        &'a self,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> impl Iterator<Item = (&'a InternalKey, &'a Entry)> {
+        // The lower bound uses seq = u64::MAX because that sorts before every
+        // real version of `start` (seq descends), so no version of the start key
+        // is skipped.
+        let lower = Bound::Included(InternalKey::new(start.to_vec(), u64::MAX));
+        let upper = match end {
+            // Likewise u64::MAX for the exclusive upper bound: it sorts before
+            // every version of `end`, so `end` itself is excluded entirely.
+            Some(e) => Bound::Excluded(InternalKey::new(e.to_vec(), u64::MAX)),
+            None => Bound::Unbounded,
+        };
+        self.map.range((lower, upper))
     }
 
     /// Removes all entries.
     pub fn clear(&mut self) {
         self.map.clear();
         self.size_bytes = 0;
-    }
-}
-
-fn entry_len(entry: &Entry) -> usize {
-    match entry {
-        Entry::Value(v) => v.len(),
-        Entry::Tombstone => 0,
+        self.max_seq = 0;
     }
 }
 
@@ -129,111 +271,217 @@ fn entry_len(entry: &Entry) -> usize {
 mod tests {
     use super::*;
 
-    fn put(t: &mut MemTable, k: &str, v: &str) {
-        t.put(k.as_bytes().to_vec(), v.as_bytes().to_vec());
+    fn put(t: &mut MemTable, k: &str, seq: u64, v: &str) {
+        t.put(k.as_bytes(), seq, v.as_bytes().to_vec());
     }
 
-    fn get(t: &MemTable, k: &str) -> Option<String> {
-        t.get(k.as_bytes())
-            .map(|v| String::from_utf8(v.to_vec()).unwrap())
+    fn get(t: &MemTable, k: &str, snapshot: u64) -> Option<String> {
+        match t.get(k.as_bytes(), snapshot) {
+            Some(Entry::Value(v)) => Some(String::from_utf8(v.clone()).unwrap()),
+            _ => None,
+        }
     }
 
     #[test]
     fn get_on_empty_table_returns_none() {
         let t = MemTable::new();
-        assert_eq!(t.get(b"absent"), None);
+        assert_eq!(t.get(b"absent", u64::MAX), None);
         assert!(t.is_empty());
     }
 
     #[test]
     fn put_then_get_round_trips() {
         let mut t = MemTable::new();
-        put(&mut t, "alpha", "one");
-        assert_eq!(get(&t, "alpha").as_deref(), Some("one"));
+        put(&mut t, "alpha", 1, "one");
+        assert_eq!(get(&t, "alpha", u64::MAX).as_deref(), Some("one"));
     }
 
     #[test]
-    fn put_overwrites_existing_value() {
+    fn an_overwrite_adds_a_version_rather_than_replacing_one() {
         let mut t = MemTable::new();
-        put(&mut t, "k", "first");
-        put(&mut t, "k", "second");
-        assert_eq!(get(&t, "k").as_deref(), Some("second"));
-        assert_eq!(t.len(), 1);
+        put(&mut t, "k", 1, "first");
+        put(&mut t, "k", 2, "second");
+
+        assert_eq!(t.len(), 2, "both versions are retained");
+        assert_eq!(get(&t, "k", u64::MAX).as_deref(), Some("second"));
     }
 
     #[test]
-    fn delete_hides_value_but_leaves_tombstone() {
+    fn a_snapshot_does_not_see_versions_written_after_it() {
         let mut t = MemTable::new();
-        put(&mut t, "k", "v");
-        assert!(t.delete(b"k".to_vec()));
-        assert_eq!(t.get(b"k"), None);
-        assert_eq!(t.get_entry(b"k"), Some(&Entry::Tombstone));
-        assert_eq!(t.len(), 1);
+        put(&mut t, "k", 1, "v1");
+        put(&mut t, "k", 5, "v5");
+        put(&mut t, "k", 9, "v9");
+
+        assert_eq!(get(&t, "k", 0), None, "before any version exists");
+        assert_eq!(get(&t, "k", 1).as_deref(), Some("v1"));
+        assert_eq!(get(&t, "k", 4).as_deref(), Some("v1"), "between versions");
+        assert_eq!(get(&t, "k", 5).as_deref(), Some("v5"), "exactly at a write");
+        assert_eq!(get(&t, "k", 8).as_deref(), Some("v5"));
+        assert_eq!(get(&t, "k", 9).as_deref(), Some("v9"));
+        assert_eq!(get(&t, "k", u64::MAX).as_deref(), Some("v9"));
     }
 
     #[test]
-    fn delete_of_absent_key_reports_no_prior_value() {
+    fn a_tombstone_hides_older_versions_but_not_from_older_snapshots() {
         let mut t = MemTable::new();
-        assert!(!t.delete(b"ghost".to_vec()));
-        assert_eq!(t.get_entry(b"ghost"), Some(&Entry::Tombstone));
+        put(&mut t, "k", 1, "v");
+        t.delete(b"k", 2);
+
+        assert_eq!(t.get(b"k", 2), Some(&Entry::Tombstone));
+        assert_eq!(get(&t, "k", 2), None);
+        // A snapshot taken before the delete still sees the value.
+        assert_eq!(get(&t, "k", 1).as_deref(), Some("v"));
     }
 
     #[test]
-    fn put_after_delete_resurrects_key() {
+    fn a_write_after_a_delete_resurrects_the_key() {
         let mut t = MemTable::new();
-        put(&mut t, "k", "v1");
-        t.delete(b"k".to_vec());
-        put(&mut t, "k", "v2");
-        assert_eq!(get(&t, "k").as_deref(), Some("v2"));
+        put(&mut t, "k", 1, "v1");
+        t.delete(b"k", 2);
+        put(&mut t, "k", 3, "v2");
+
+        assert_eq!(get(&t, "k", 3).as_deref(), Some("v2"));
+        assert_eq!(t.get(b"k", 2), Some(&Entry::Tombstone));
+        assert_eq!(get(&t, "k", 1).as_deref(), Some("v1"));
     }
 
     #[test]
-    fn iteration_is_in_sorted_key_order() {
+    fn a_seek_past_a_keys_versions_does_not_leak_the_next_key() {
         let mut t = MemTable::new();
-        for k in ["delta", "alpha", "charlie", "bravo"] {
-            put(&mut t, k, "x");
-        }
-        let keys: Vec<_> = t
-            .iter_values()
-            .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        put(&mut t, "a", 10, "a-value");
+        put(&mut t, "b", 1, "b-value");
+
+        // Snapshot 5 is older than every version of "a", and the seek would
+        // otherwise land on ("b", 1).
+        assert_eq!(t.get(b"a", 5), None);
+    }
+
+    #[test]
+    fn internal_keys_order_by_key_then_descending_sequence() {
+        let mut keys = vec![
+            InternalKey::new(b"b".to_vec(), 1),
+            InternalKey::new(b"a".to_vec(), 1),
+            InternalKey::new(b"a".to_vec(), 9),
+            InternalKey::new(b"a".to_vec(), 5),
+        ];
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                InternalKey::new(b"a".to_vec(), 9),
+                InternalKey::new(b"a".to_vec(), 5),
+                InternalKey::new(b"a".to_vec(), 1),
+                InternalKey::new(b"b".to_vec(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn compare_internal_matches_the_internal_key_ordering() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_internal(b"a", 1, b"b", 1), Ordering::Less);
+        assert_eq!(compare_internal(b"a", 1, b"a", 9), Ordering::Greater);
+        assert_eq!(compare_internal(b"a", 9, b"a", 1), Ordering::Less);
+        assert_eq!(compare_internal(b"a", 5, b"a", 5), Ordering::Equal);
+    }
+
+    #[test]
+    fn iteration_is_in_internal_key_order() {
+        let mut t = MemTable::new();
+        put(&mut t, "delta", 1, "x");
+        put(&mut t, "alpha", 2, "x");
+        put(&mut t, "alpha", 7, "x");
+        put(&mut t, "charlie", 3, "x");
+
+        let seen: Vec<_> = t
+            .iter()
+            .map(|(k, _)| (String::from_utf8(k.user_key.clone()).unwrap(), k.seq))
             .collect();
-        assert_eq!(keys, ["alpha", "bravo", "charlie", "delta"]);
+        assert_eq!(
+            seen,
+            vec![
+                ("alpha".into(), 7),
+                ("alpha".into(), 2),
+                ("charlie".into(), 3),
+                ("delta".into(), 1),
+            ]
+        );
     }
 
     #[test]
-    fn iter_values_skips_tombstones() {
+    fn range_is_half_open_and_keeps_every_version_of_the_start_key() {
         let mut t = MemTable::new();
-        put(&mut t, "a", "1");
-        put(&mut t, "b", "2");
-        t.delete(b"a".to_vec());
-        let live: Vec<_> = t.iter_values().map(|(k, _)| k.to_vec()).collect();
-        assert_eq!(live, [b"b".to_vec()]);
+        for (k, seq) in [("a", 1), ("b", 2), ("b", 8), ("c", 3), ("d", 4)] {
+            put(&mut t, k, seq, "x");
+        }
+
+        let seen: Vec<_> = t
+            .range(b"b", Some(b"d"))
+            .map(|(k, _)| (String::from_utf8(k.user_key.clone()).unwrap(), k.seq))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![("b".into(), 8), ("b".into(), 2), ("c".into(), 3)],
+            "start inclusive with all its versions, end exclusive"
+        );
     }
 
     #[test]
-    fn size_tracking_accounts_for_overwrites_and_deletes() {
+    fn an_unbounded_range_runs_to_the_end() {
         let mut t = MemTable::new();
-        put(&mut t, "key", "value"); // 3 + 5
-        assert_eq!(t.size_bytes(), 8);
-        put(&mut t, "key", "v"); // 3 + 1
-        assert_eq!(t.size_bytes(), 4);
-        t.delete(b"key".to_vec()); // 3 + 0
-        assert_eq!(t.size_bytes(), 3);
+        for (k, seq) in [("a", 1), ("b", 2), ("c", 3)] {
+            put(&mut t, k, seq, "x");
+        }
+        assert_eq!(t.range(b"b", None).count(), 2);
+        assert_eq!(t.range(b"", None).count(), 3);
+    }
+
+    #[test]
+    fn size_tracking_grows_with_every_version() {
+        let mut t = MemTable::new();
+        put(&mut t, "key", 1, "value"); // 3 + 8 + 5
+        assert_eq!(t.size_bytes(), 16);
+        put(&mut t, "key", 2, "v"); // 3 + 8 + 1
+        assert_eq!(t.size_bytes(), 28, "an overwrite adds, never subtracts");
+        t.delete(b"key", 3); // 3 + 8 + 0
+        assert_eq!(t.size_bytes(), 39);
+    }
+
+    #[test]
+    fn max_seq_tracks_the_highest_sequence_inserted() {
+        let mut t = MemTable::new();
+        assert_eq!(t.max_seq(), 0);
+        put(&mut t, "a", 4, "x");
+        put(&mut t, "b", 2, "x");
+        assert_eq!(t.max_seq(), 4);
     }
 
     #[test]
     fn binary_keys_and_values_are_supported() {
         let mut t = MemTable::new();
-        t.put(vec![0x00, 0xff], vec![0xde, 0xad, 0xbe, 0xef]);
-        assert_eq!(t.get(&[0x00, 0xff]), Some(&[0xde, 0xad, 0xbe, 0xef][..]));
+        t.put(&[0x00, 0xff], 1, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            t.get(&[0x00, 0xff], 1),
+            Some(&Entry::Value(vec![0xde, 0xad, 0xbe, 0xef]))
+        );
+    }
+
+    #[test]
+    fn an_empty_value_is_distinct_from_a_tombstone() {
+        let mut t = MemTable::new();
+        t.put(b"k", 1, Vec::new());
+        assert_eq!(t.get(b"k", 1), Some(&Entry::Value(Vec::new())));
+        assert!(!t.get(b"k", 1).unwrap().is_tombstone());
     }
 
     #[test]
     fn clear_empties_the_table() {
         let mut t = MemTable::new();
-        put(&mut t, "a", "1");
+        put(&mut t, "a", 1, "1");
         t.clear();
         assert!(t.is_empty());
         assert_eq!(t.size_bytes(), 0);
+        assert_eq!(t.max_seq(), 0);
     }
 }

@@ -34,6 +34,13 @@
 //! that means tombstones survive unless the merge includes the *oldest* table in
 //! the store — see [`CompactionTask::drop_tombstones`].
 //!
+//! # The third rule, added by MVCC
+//!
+//! **An old version may only be collected once no open snapshot can read it.**
+//! Compaction is the only place versions are ever reclaimed, so it takes the
+//! oldest live snapshot's sequence number and keeps everything at or above it,
+//! plus one version beneath it per key. See [`merge_into`].
+//!
 //! # Crash safety
 //!
 //! Replacing N tables with 1 is not a single atomic operation: the output must
@@ -52,7 +59,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::memtable::Entry;
+use crate::memtable::{Entry, compare_internal};
 use crate::sstable::{SsTable, SsTableIter, SsTableWriter, TableMeta};
 use crate::wal::sync_parent_dir;
 
@@ -186,29 +193,136 @@ pub fn plan(tables: &[TableInfo], config: &CompactionConfig) -> Option<Compactio
 
 /// Merges `inputs` into a single new table at `output`.
 ///
-/// `inputs` must be ordered oldest first; later tables win on duplicate keys.
-/// Returns the metadata of the table produced.
+/// `inputs` must be ordered oldest first. Returns the metadata of the table
+/// produced.
+///
+/// # What gets collected, and why
+///
+/// Under MVCC a compaction is the only place old versions are ever reclaimed, so
+/// it has to know which ones are still reachable. Two rules, both conservative:
+///
+/// - **Version collection.** For each user key, every version newer than
+///   `oldest_snapshot` is kept — some open snapshot may still read it — plus the
+///   newest version at or below `oldest_snapshot`, which is what the oldest
+///   reader sees. Everything older than that is unreachable by any present or
+///   future reader and is dropped. Passing `oldest_snapshot = u64::MAX` collapses
+///   this to "keep only the newest version of each key".
+/// - **Tombstone lifetime.** A tombstone may only be dropped when no older table
+///   can still hold a value for that key, which here means the merge includes the
+///   oldest table in the store (`drop_tombstones`). Even then only *trailing*
+///   tombstones go: a tombstone that still shadows a kept older version has to
+///   stay, or the delete silently reverts.
 pub fn merge_into(
     inputs: &[SsTable],
     output: &Path,
     drop_tombstones: bool,
+    oldest_snapshot: u64,
 ) -> io::Result<TableMeta> {
     let mut writer = SsTableWriter::create(output)?;
+    let mut collector = VersionCollector::new(drop_tombstones, oldest_snapshot);
+
     for item in MergeIter::new(inputs)? {
-        let (key, entry) = item?;
-        if drop_tombstones && matches!(entry, Entry::Tombstone) {
-            continue;
+        let (key, seq, entry) = item?;
+        for (key, seq, entry) in collector.accept(key, seq, entry) {
+            writer.append(&key, seq, &entry)?;
         }
-        writer.append(&key, &entry)?;
+    }
+    for (key, seq, entry) in collector.finish() {
+        writer.append(&key, seq, &entry)?;
     }
     writer.finish()
 }
 
-/// Merges sorted table iterators into one ascending, deduplicated stream.
+/// Decides which versions of the merged stream survive into the output table.
 ///
-/// On a duplicate key the entry from the newest input wins; tombstones are
-/// preserved as entries in their own right, since a tombstone *is* the newest
-/// value for its key.
+/// Kept separate from [`merge_into`] because the rules are the part worth
+/// testing directly — the I/O around them is not where the subtlety lives.
+struct VersionCollector {
+    drop_tombstones: bool,
+    oldest_snapshot: u64,
+    /// User key currently being processed.
+    current: Option<Vec<u8>>,
+    /// Set once a version at or below `oldest_snapshot` has been kept for the
+    /// current key; every older version of it is then unreachable.
+    anchored: bool,
+    /// Tombstones held back because they might turn out to be trailing.
+    ///
+    /// A tombstone is only droppable if nothing older survives beneath it, and
+    /// that is not known until either an older kept version arrives (flush them)
+    /// or the key ends (discard them).
+    pending_tombstones: Vec<(Vec<u8>, u64)>,
+}
+
+impl VersionCollector {
+    fn new(drop_tombstones: bool, oldest_snapshot: u64) -> Self {
+        Self {
+            drop_tombstones,
+            oldest_snapshot,
+            current: None,
+            anchored: false,
+            pending_tombstones: Vec::new(),
+        }
+    }
+
+    /// Feeds one version in and returns whatever is now known to survive.
+    fn accept(&mut self, key: Vec<u8>, seq: u64, entry: Entry) -> Vec<(Vec<u8>, u64, Entry)> {
+        let mut out = Vec::new();
+
+        if self.current.as_deref() != Some(key.as_slice()) {
+            // A new key: anything still pending belonged to the previous key and
+            // had nothing older beneath it, so it can go.
+            out.extend(self.drain_pending_as_dropped());
+            self.current = Some(key.clone());
+            self.anchored = false;
+        }
+
+        // Unreachable: an older version than the one the oldest snapshot reads.
+        if self.anchored {
+            return out;
+        }
+        if seq <= self.oldest_snapshot {
+            self.anchored = true;
+        }
+
+        if entry.is_tombstone() && self.drop_tombstones {
+            // Hold it: droppable only if nothing older survives under it.
+            self.pending_tombstones.push((key, seq));
+            return out;
+        }
+
+        // A surviving non-tombstone means every held tombstone above it is still
+        // shadowing something and must be written out too.
+        out.extend(
+            self.pending_tombstones
+                .drain(..)
+                .map(|(k, s)| (k, s, Entry::Tombstone)),
+        );
+        out.push((key, seq, entry));
+        out
+    }
+
+    /// Flushes whatever remains once the stream ends.
+    fn finish(&mut self) -> Vec<(Vec<u8>, u64, Entry)> {
+        self.drain_pending_as_dropped()
+    }
+
+    /// Discards held tombstones when they are droppable, or emits them when not.
+    fn drain_pending_as_dropped(&mut self) -> Vec<(Vec<u8>, u64, Entry)> {
+        // `drop_tombstones` is the only reason anything is ever held, so reaching
+        // here with a non-empty queue means these are trailing tombstones with
+        // nothing older beneath them anywhere in the store.
+        self.pending_tombstones.clear();
+        Vec::new()
+    }
+}
+
+/// Merges sorted table iterators into one ascending stream in internal-key
+/// order — user key ascending, sequence number descending.
+///
+/// Every version is emitted; deciding which ones survive is
+/// [`VersionCollector`]'s job, not this one's. Sequence numbers are globally
+/// unique per mutation, so two inputs never carry the same internal key; if one
+/// somehow did, the newest input wins, matching the read path.
 ///
 /// Implemented as a linear scan across the input cursors rather than a binary
 /// heap. A compaction merges at most `max_merge_width` tables — ten by default —
@@ -223,7 +337,7 @@ pub struct MergeIter {
 struct Cursor {
     iter: SsTableIter,
     /// The next entry from this input, or `None` once it is exhausted.
-    head: Option<(Vec<u8>, Entry)>,
+    head: Option<(Vec<u8>, u64, Entry)>,
 }
 
 impl MergeIter {
@@ -257,41 +371,40 @@ impl Cursor {
 }
 
 impl Iterator for MergeIter {
-    type Item = io::Result<(Vec<u8>, Entry)>;
+    type Item = io::Result<(Vec<u8>, u64, Entry)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.failed {
             return None;
         }
 
-        // Smallest key across all cursors.
-        let min_key = self
+        // Smallest internal key across all cursors.
+        let (min_key, min_seq) = self
             .cursors
             .iter()
-            .filter_map(|c| c.head.as_ref().map(|(k, _)| k))
-            .min()?
-            .clone();
+            .filter_map(|c| c.head.as_ref().map(|(k, s, _)| (k.clone(), *s)))
+            .min_by(|(ak, as_), (bk, bs)| compare_internal(ak, *as_, bk, *bs))?;
 
-        // Among the cursors sitting on that key, the newest input wins. Cursors
-        // are in oldest-first order, so the last match is the newest.
+        // Among the cursors sitting on that internal key, the newest input wins.
+        // Cursors are in oldest-first order, so the last match is the newest.
         let mut winner: Option<Entry> = None;
         for cursor in self.cursors.iter_mut() {
             let matches = cursor
                 .head
                 .as_ref()
-                .is_some_and(|(k, _)| k.as_slice() == min_key.as_slice());
+                .is_some_and(|(k, s, _)| k.as_slice() == min_key.as_slice() && *s == min_seq);
             if !matches {
                 continue;
             }
-            // Every copy of this key is consumed, not just the winning one.
-            winner = cursor.head.take().map(|(_, entry)| entry);
+            // Every copy of this internal key is consumed, not just the winner.
+            winner = cursor.head.take().map(|(_, _, entry)| entry);
             if let Err(e) = cursor.advance() {
                 self.failed = true;
                 return Some(Err(e));
             }
         }
 
-        winner.map(|entry| Ok((min_key, entry)))
+        winner.map(|entry| Ok((min_key, min_seq, entry)))
     }
 }
 

@@ -294,7 +294,7 @@ fn a_crash_partway_through_a_record_never_applies_that_record() {
     let store = TempStore::new("torn-record");
 
     let mut db =
-        Db::open_with_options(&store.0, options(FaultPlan::crash_after_wal_bytes(40))).unwrap();
+        Db::open_with_options(&store.0, options(FaultPlan::crash_after_wal_bytes(60))).unwrap();
 
     db.put(b"first", b"durable").unwrap();
     let err = loop {

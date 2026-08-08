@@ -61,12 +61,15 @@ fn deletes_leave_tombstones_rather_than_erasing_keys() {
     // Tombstones matter because older SSTables may still hold a value for the
     // key; the delete has to shadow them until compaction drops both.
     let mut table = MemTable::new();
-    table.put(b"k".to_vec(), b"v".to_vec());
-    table.delete(b"k".to_vec());
+    table.put(b"k", 1, b"v".to_vec());
+    table.delete(b"k", 2);
 
-    assert_eq!(table.get(b"k"), None);
-    assert_eq!(table.get_entry(b"k"), Some(&Entry::Tombstone));
-    assert_eq!(table.len(), 1, "the tombstone still occupies a slot");
+    assert_eq!(table.get(b"k", u64::MAX), Some(&Entry::Tombstone));
+    assert_eq!(
+        table.len(),
+        2,
+        "the tombstone is a version in its own right, above the value it hides"
+    );
 }
 
 #[test]
@@ -77,9 +80,10 @@ fn entries_iterate_in_sorted_key_order() {
     }
 
     let keys: Vec<String> = db
-        .memtable()
-        .iter_values()
-        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .scan()
+        .unwrap()
+        .into_keys()
+        .map(|k| String::from_utf8(k).unwrap())
         .collect();
 
     assert_eq!(keys, ["alpha", "bravo", "mike", "zeta"]);
@@ -116,13 +120,20 @@ fn many_keys_are_all_retrievable() {
 }
 
 #[test]
-fn buffered_size_grows_with_writes_and_shrinks_on_delete() {
+fn buffered_size_grows_with_every_version_written() {
+    // Under MVCC the buffer only ever grows: an overwrite or a delete *adds* a
+    // version rather than replacing one, because older snapshots may still need
+    // to read what came before. Each version costs key + 8-byte sequence number
+    // + payload.
     let mut db = Db::new();
     assert_eq!(db.size_bytes(), 0);
 
-    db.put(b"abc", b"12345").unwrap(); // 3 + 5
-    assert_eq!(db.size_bytes(), 8);
+    db.put(b"abc", b"12345").unwrap(); // 3 + 8 + 5
+    assert_eq!(db.size_bytes(), 16);
 
-    db.delete(b"abc").unwrap(); // key retained, value dropped
-    assert_eq!(db.size_bytes(), 3);
+    db.put(b"abc", b"9").unwrap(); // 3 + 8 + 1
+    assert_eq!(db.size_bytes(), 28);
+
+    db.delete(b"abc").unwrap(); // 3 + 8 + 0
+    assert_eq!(db.size_bytes(), 39);
 }

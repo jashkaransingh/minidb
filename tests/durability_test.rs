@@ -230,16 +230,11 @@ fn the_log_records_exactly_the_mutations_issued() {
     assert_eq!(
         recovery.records,
         vec![
-            Record::Put {
-                key: b"a".to_vec(),
-                value: b"1".to_vec()
-            },
-            Record::Delete { key: b"a".to_vec() },
-            Record::Put {
-                key: b"b".to_vec(),
-                value: b"2".to_vec()
-            },
-        ]
+            Record::put(1, b"a".to_vec(), b"1".to_vec()),
+            Record::delete(2, b"a".to_vec()),
+            Record::put(3, b"b".to_vec(), b"2".to_vec()),
+        ],
+        "each mutation carries the sequence number it was assigned"
     );
     assert!(!recovery.truncated());
 }

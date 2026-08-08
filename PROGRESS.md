@@ -588,3 +588,177 @@ justify it — all three facts are stated in the module docs and the README rath
 
 MVCC/snapshot isolation, a streaming range-scan iterator, background compaction, a TCP wire protocol,
 and benchmarks against sled/RocksDB.
+
+---
+
+# Part II — MVCC, concurrency, and measurement
+
+A second pass over the store, aimed at a specific set of claims: snapshot
+isolation, reads that do not block behind writes, group-commit batching, a real
+streaming range iterator, crash testing at scale, and measured numbers for write
+amplification, throughput, and latency.
+
+Ground rule for this whole part: **every number below is copied from a real run**
+— a `cargo test` line, or a results file committed under `bench/`. Where a
+measurement came out worse than hoped, the measured value is what is written
+down.
+
+---
+
+## Capability 1 — MVCC with snapshot isolation
+
+**Status:** complete. Build, test, clippy (`-D warnings`), and fmt all clean.
+207 tests pass, up from 173 (`cargo test`, all targets plus doctests).
+
+### The visibility rule
+
+Stated once, in `src/lib.rs`'s crate docs, and referenced from every layer that
+has to honour it:
+
+> A read at snapshot `S` resolves `key` to the version of `key` with the
+> **greatest sequence number `<= S`**, searching the memtable first and then the
+> on-disk tables newest-first. If that version is a tombstone the key reads as
+> absent; if no such version exists in any level, the key reads as absent.
+> Versions with sequence number `> S` are invisible and are never consulted.
+
+Three consequences, each a place the rule is easy to break:
+
+- **An overwrite adds a version, it does not replace one.** A `put` at seq 9
+  leaves the seq 4 version in place; a snapshot at 5 still reads it.
+- **A tombstone is a version, not an erasure.** A delete at seq 7 makes the key
+  absent for snapshots `>= 7` and leaves it readable for snapshots `< 7`. A
+  search that finds a tombstone at or below its snapshot must *stop* — falling
+  through to an older level reverts the delete.
+- **The first level with any visible version wins outright.** Compaction only
+  moves versions downward and never reorders them, so a newer level can never
+  hold an older version than an older level.
+
+### What was built
+
+**`memtable::InternalKey`** — the pair `(user_key, seq)`, ordered **user key
+ascending, sequence number descending**. That ordering is the whole mechanism:
+all versions of a key are adjacent and run newest-first, so "the newest version
+visible at `S`" is the single entry the seek to `(key, S)` lands on. Every
+version newer than `S` sorts strictly *before* the probe; every version at or
+older than `S` sorts at or after it. No scanning past invisible versions, no
+special cases.
+
+The one trap is the seek running off the end of a key's versions — if every
+version of `key` is newer than `S`, the seek lands on the *next* user key.
+`MemTable::get` checks the user key of what it found before returning it, and
+there is a test named for exactly that case.
+
+**WAL format, rebuilt around frames.** Records now carry their sequence number,
+and the unit of writing and recovery is a *frame*: `crc32 | count | payload_len |
+payload`, where the payload is `count` mutations. The checksum spans the whole
+frame. This was done now rather than during capability 3 because adding `seq`
+was already a format break, and doing one break instead of two is worth more
+than deferring the work. It also delivers the property group commit needs for
+free: a frame is recovered in full or not at all.
+
+**SSTable format version 2.** Entries are `kind | seq | key_len | value_len | key
+| value`; the sparse index records each block's first *internal* key
+(`first_key` + `first_seq`); the meta section gained `max_seq`. Version 1 tables
+are rejected on open rather than misparsed — the entry header changed width, so
+there is no way to read one safely. There is no in-tree upgrade path; a pre-MVCC
+store has to be rebuilt. That is the right call for a pre-1.0 embedded store with
+no deployed users, and it is stated in the module docs.
+
+**`snapshot::SnapshotRegistry` and `Snapshot`.** A snapshot is a captured
+sequence number plus a registration. The registry is a multiset of live sequence
+numbers; compaction asks it for the oldest and keeps everything at or above it.
+A snapshot deregisters on `Drop`.
+
+**Compaction learned version collection.** `merge_into` now takes
+`oldest_snapshot` and applies two rules:
+
+- For each user key, keep every version newer than `oldest_snapshot` (some open
+  snapshot may read it), plus the newest version at or below it (what the oldest
+  reader sees). Everything older is unreachable and is dropped.
+- Tombstones may still only be dropped when the merge includes the oldest table,
+  and then only *trailing* ones — a tombstone that still shadows a kept older
+  version has to stay, or the delete reverts.
+
+### Key design decisions, and why
+
+**`(user_key, seq)` with seq descending, rather than a separate version list per
+key.** A per-key version list would mean the on-disk format stops being a flat
+sorted run, which breaks the sparse index, the merge iterator, and the block
+layout all at once. Encoding the version *into the sort key* keeps every existing
+structure working unchanged and turns snapshot resolution into a seek. The cost
+is 8 bytes per entry on disk and in the memtable.
+
+**Sequence numbers are recovered from table metadata, not just the log.** After a
+flush the log is empty, so the tables are the only record of how far the counter
+advanced. `open` takes the maximum of the log's highest sequence and every
+table's `max_seq`. Getting this wrong is quiet and nasty: a restart that reused
+sequence numbers would write a version that sorts *above* an existing one for the
+same key and silently shadow it. There is a test that flushes, reopens, and
+asserts the counter resumed.
+
+**Visibility is advanced only after durability.** `Db::apply` assigns a sequence,
+appends to the log (fsync included), inserts into the memtable, and only then
+advances `visible_seq`. A reader can therefore never observe a write that a crash
+would lose. Sequence numbers can end up with gaps when a write fails partway;
+gaps are harmless, since the rule only ever compares magnitudes.
+
+**Compaction takes the *minimum* of (oldest live snapshot, current sequence).**
+Safe against a snapshot created during the merge: any future snapshot has a
+sequence at least this high, so anything kept for this floor covers it too.
+
+**The bloom filter hashes distinct user keys only.** Versions of one key share a
+probe, so a heavily-overwritten table does not get an oversized filter.
+
+**Point lookups walk forward from the candidate block.** Versions of one key can
+straddle a block boundary, so the block holding the probe's insertion point may
+end before the first visible version. `SsTable::get` continues into the next
+block rather than reporting absent. In practice it reads exactly one block; the
+loop exists for the boundary case, which is the one a single-block read gets
+silently wrong.
+
+**Tables hold their file descriptor open.** Previously every block read did a
+fresh `File::open(path)`. That had to change for capability 2 — compaction
+unlinks its inputs while readers may still hold them, and on Unix an unlinked
+file stays readable through an already-open descriptor. Reads now use positional
+`read_at`/`seek_read`, which is also correct for sharing one handle between
+threads, where a `seek`-then-`read` pair would race. The corollary is a real
+portability limit, documented on the type: on Windows the unlink fails while a
+descriptor is open, so concurrent compaction is a Unix-only guarantee.
+
+### What is tested
+
+14 new integration tests in `tests/mvcc_test.rs`, plus new unit tests in
+`memtable.rs`, `snapshot.rs`, and `wal.rs`. The cases chosen are the ones where a
+version crosses a *boundary*, since that is where the rule breaks:
+
+- A snapshot is unmoved by 250 writes landing on top of it.
+- A snapshot survives its versions being flushed from the memtable into one
+  SSTable, and survives them being **split across two tables** — where the newest
+  table holds only the invisible version and the search must fall through.
+- An open snapshot stops compaction collecting what it reads; dropping it lets
+  compaction reclaim again (ten versions collapse to one).
+- A delete is invisible to a snapshot taken before it, and a tombstone stops the
+  search rather than resurrecting an older table's value, including after reopen.
+- Sequence numbers resume correctly after a reopen that reads them from **tables**
+  (log rotated away) and after one that replays them from the **log**.
+- Every version reaches disk in internal-key order, asserted pairwise over a
+  9-entry table.
+- An empty value is not a tombstone, at any snapshot, in memory or on disk.
+- Ten snapshots at ten different points each read their own past.
+- A 300-key mixed workload (overwrites, deletes, many flushes and compactions)
+  is correct both at a snapshot and in the present, and again after a reopen.
+- The WAL suite gained an exhaustive test that tears a 3-record batch at **every
+  byte offset inside the frame** and asserts no prefix of it is ever recovered.
+
+### Known limitations (deliberate)
+
+- **`Db` is still `&mut self`,** and `SharedDb` is still a whole-store `RwLock`,
+  so a write still blocks readers. Capability 2.
+- **`scan`/`len` still materialize** the merged view in memory. Capability 4.
+- **No group-commit machinery yet** — the frame format supports it, but each
+  `put` still writes a frame of one and pays its own fsync. Capability 3.
+- A long-lived snapshot pins every version written after it, so space
+  amplification grows without bound while it is held. Inherent to MVCC; the fix
+  is to not hold snapshots open, and the cost is documented on the type.
+- Version collection runs only at compaction, so a store that never compacts
+  never reclaims.

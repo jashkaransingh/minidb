@@ -2,19 +2,23 @@
 //!
 //! # Status
 //!
-//! The storage engine is complete for single-threaded use. Mutations are
-//! appended to a write-ahead log and fsynced before they are acknowledged; the
-//! memtable is flushed to an immutable SSTable once it passes its threshold; and
-//! size-tiered [`compaction`] merges tables to bound read cost and reclaim
-//! space. Reads search the memtable and then each table newest-first, filtered
-//! by key range, a [`bloom`] filter, and a sparse block index.
+//! Mutations are appended to a write-ahead log and fsynced before they are
+//! acknowledged; the memtable is flushed to an immutable SSTable once it passes
+//! its threshold; and size-tiered [`compaction`] merges tables to bound read
+//! cost and reclaim space. Reads search the memtable and then each table
+//! newest-first, filtered by key range, a [`bloom`] filter, and a sparse block
+//! index.
+//!
+//! Every write carries a **sequence number**, and reads resolve against a
+//! **snapshot** of that counter, so a reader sees a consistent point-in-time
+//! view even while writes land underneath it. See [`Db::snapshot`].
 //!
 //! [`Db`] itself is single-threaded — it takes `&mut self` to write, so
 //! exclusive access is a compile-time fact and costs nothing at runtime. For
 //! multi-threaded use, [`SharedDb`] wraps it in a reader–writer lock.
 //!
-//! Not yet present: MVCC/snapshot isolation, a streaming range-scan iterator,
-//! and background (rather than inline) compaction.
+//! Not yet present: a streaming range-scan iterator, group-commit batching, and
+//! background (rather than inline) compaction.
 //!
 //! # Design
 //!
@@ -23,6 +27,38 @@
 //! read-modify-write a page. Reads pay for that by searching newest-to-oldest
 //! across the memtable and then each on-disk table, which is why bloom filters
 //! and a sparse per-table index matter so much.
+//!
+//! # MVCC visibility rule
+//!
+//! This is the invariant every layer below has to agree on, stated once:
+//!
+//! > A read at snapshot `S` resolves `key` to the version of `key` with the
+//! > **greatest sequence number `≤ S`**, searching the memtable first and then
+//! > the on-disk tables newest-first. If that version is a tombstone the key
+//! > reads as absent; if no such version exists in any level, the key reads as
+//! > absent. Versions with sequence number `> S` are invisible and are never
+//! > consulted.
+//!
+//! Three consequences worth spelling out, because each is a place the rule is
+//! easy to break:
+//!
+//! - **An overwrite adds a version, it does not replace one.** `put` at seq 9
+//!   leaves the seq 4 version in place; a snapshot at 5 still reads it. Storage
+//!   is keyed by [`memtable::InternalKey`] — `(user_key, seq)` ordered *user key
+//!   ascending, seq descending* — so all versions of a key are adjacent and run
+//!   newest-first, and the visible version is one seek away.
+//! - **A tombstone is a version, not an erasure.** A delete at seq 7 makes the
+//!   key absent for snapshots ≥ 7 and leaves it readable for snapshots < 7. A
+//!   search that finds a tombstone at or below its snapshot must *stop* — it
+//!   must not fall through to an older level, or the delete reverts.
+//! - **The first level that has any visible version wins outright.** Levels are
+//!   searched newest-first, so a hit stops the search even if an older level
+//!   holds a version with a *higher* sequence number — which cannot happen,
+//!   because compaction only ever moves versions downward and never reorders
+//!   them.
+//!
+//! Old versions are reclaimed only by [`compaction::merge_into`], and only once
+//! no live snapshot can reach them.
 //!
 //! # Examples
 //!
@@ -37,6 +73,22 @@
 //!
 //! db.delete(b"lang")?;
 //! assert_eq!(db.get(b"lang")?, None);
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! A snapshot pins a point in time:
+//!
+//! ```
+//! use minidb::Db;
+//!
+//! let mut db = Db::new();
+//! db.put(b"k", b"before")?;
+//!
+//! let snap = db.snapshot();
+//! db.put(b"k", b"after")?;
+//!
+//! assert_eq!(db.get(b"k")?, Some(b"after".to_vec()));
+//! assert_eq!(db.get_at(&snap, b"k")?, Some(b"before".to_vec()));
 //! # Ok::<(), std::io::Error>(())
 //! ```
 //!
@@ -63,19 +115,22 @@ pub mod compaction;
 pub mod concurrent;
 pub mod fault;
 pub mod memtable;
+pub mod snapshot;
 pub mod sstable;
 pub mod wal;
 
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use compaction::{Marker, merge_into, plan};
 
 pub use compaction::{COMPACTION_MARKER, CompactionConfig, CompactionTask, TableInfo};
 pub use concurrent::SharedDb;
 pub use fault::FaultPlan;
-pub use memtable::{Entry, MemTable};
+pub use memtable::{Entry, InternalKey, MemTable};
+pub use snapshot::{Snapshot, SnapshotRegistry};
 pub use sstable::{SsTable, SsTableWriter, TableMeta};
 pub use wal::{Record, Recovery, SyncPolicy, Wal};
 
@@ -128,7 +183,15 @@ pub struct Db {
     dir: Option<PathBuf>,
     /// Tables ordered oldest first; later entries shadow earlier ones.
     tables: Vec<OpenTable>,
-    next_seq: u64,
+    /// Next free recency slot for a table filename. Unrelated to write
+    /// sequence numbers, which version the *data*.
+    next_table_seq: u64,
+    /// Sequence number the next mutation will be assigned.
+    next_write_seq: u64,
+    /// Highest sequence number that is durable and applied. Every read resolves
+    /// against this unless given an explicit snapshot.
+    visible_seq: u64,
+    snapshots: Arc<SnapshotRegistry>,
     options: DbOptions,
 }
 
@@ -149,7 +212,10 @@ impl Db {
             wal: None,
             dir: None,
             tables: Vec::new(),
-            next_seq: 0,
+            next_table_seq: 0,
+            next_write_seq: 1,
+            visible_seq: 0,
+            snapshots: Arc::new(SnapshotRegistry::new()),
             options: DbOptions::default(),
         }
     }
@@ -180,6 +246,11 @@ impl Db {
     /// copies of that data present. That is the safe direction to fail: replay
     /// puts the same entries back into the memtable, where they shadow the
     /// identical entries in the table, so reads are unaffected.
+    ///
+    /// The write sequence counter is rebuilt from the highest sequence number
+    /// found anywhere — in the log *or* in any table's metadata. Tables are the
+    /// binding half: after a flush the log is empty, so they are the only record
+    /// of how far the counter had advanced.
     pub fn open_with_options<P: AsRef<Path>>(dir: P, options: DbOptions) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
@@ -189,20 +260,22 @@ impl Db {
         // read alongside the inputs it was replacing.
         compaction::recover(&dir)?;
         remove_stale_temp_files(&dir)?;
-        let (tables, next_seq) = discover_tables(&dir)?;
+        let (tables, next_table_seq) = discover_tables(&dir)?;
 
         let wal_path = dir.join(WAL_FILENAME);
         let recovery = Wal::replay(&wal_path)?;
 
         let mut memtable = MemTable::new();
         for record in &recovery.records {
-            match record {
-                Record::Put { key, value } => memtable.put(key.clone(), value.clone()),
-                Record::Delete { key } => {
-                    memtable.delete(key.clone());
-                }
-            }
+            memtable.insert(&record.key, record.seq, record.entry.clone());
         }
+
+        let table_max_seq = tables
+            .iter()
+            .map(|t| t.table.meta().max_seq)
+            .max()
+            .unwrap_or(0);
+        let max_seq = table_max_seq.max(recovery.max_seq());
 
         let mut wal = Wal::open(&wal_path, options.sync_policy)?;
         wal.set_fault_plan(options.fault);
@@ -212,7 +285,10 @@ impl Db {
             wal: Some(wal),
             dir: Some(dir),
             tables,
-            next_seq,
+            next_table_seq,
+            next_write_seq: max_seq + 1,
+            visible_seq: max_seq,
+            snapshots: Arc::new(SnapshotRegistry::new()),
             options,
         })
     }
@@ -222,50 +298,80 @@ impl Db {
     /// On a durable store this returns only after the mutation is in the log
     /// (and fsynced, under the default policy). If it returns `Ok`, the write
     /// will survive a crash. May trigger a memtable flush.
+    ///
+    /// Under MVCC this *adds a version*: readers holding an older snapshot keep
+    /// seeing what they saw.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
-        if let Some(wal) = self.wal.as_mut() {
-            wal.append(&Record::Put {
-                key: key.to_vec(),
-                value: value.to_vec(),
-            })?;
-        }
-        self.memtable.put(key.to_vec(), value.to_vec());
-        self.maybe_flush()
+        self.apply(key, Entry::Value(value.to_vec()))
     }
 
-    /// Deletes `key`, returning `true` if a live value was visible in the
-    /// memtable beforehand.
+    /// Deletes `key`, returning `true` if a live value was visible beforehand.
     ///
-    /// The return value reflects only the memtable, not the on-disk tables —
-    /// answering it accurately across every level would require a full lookup
-    /// on each delete, which defeats the point of an append-only write path.
-    /// Recorded as a tombstone rather than an erasure; see [`Entry`].
+    /// Recorded as a tombstone rather than an erasure: older tables on disk are
+    /// immutable and may still hold a value, and older snapshots must keep
+    /// reading it. See [`Entry`].
     pub fn delete(&mut self, key: &[u8]) -> io::Result<bool> {
-        if let Some(wal) = self.wal.as_mut() {
-            wal.append(&Record::Delete { key: key.to_vec() })?;
-        }
-        let existed = self.memtable.delete(key.to_vec());
-        self.maybe_flush()?;
+        let existed = self.get(key)?.is_some();
+        self.apply(key, Entry::Tombstone)?;
         Ok(existed)
     }
 
-    /// Reads the value at `key`, or `None` if absent or deleted.
+    /// Assigns a sequence number, logs the mutation, then applies it.
     ///
-    /// Searches newest to oldest — memtable first, then each table in reverse
-    /// order of creation — and stops at the first entry found, whether that is
-    /// a value or a tombstone.
-    pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        match self.memtable.get_entry(key) {
-            Some(Entry::Value(v)) => return Ok(Some(v.clone())),
-            Some(Entry::Tombstone) => return Ok(None),
-            None => {}
-        }
+    /// The ordering is the durability argument: nothing becomes *visible* until
+    /// it is durable. `visible_seq` is advanced only after both the log append
+    /// and the memtable insert have succeeded, so a reader can never observe a
+    /// write that a crash would then lose.
+    fn apply(&mut self, key: &[u8], entry: Entry) -> io::Result<()> {
+        let seq = self.next_write_seq;
+        self.next_write_seq += 1;
 
+        if let Some(wal) = self.wal.as_mut() {
+            wal.append(&Record {
+                seq,
+                key: key.to_vec(),
+                entry: entry.clone(),
+            })?;
+        }
+        self.memtable.insert(key, seq, entry);
+        self.visible_seq = seq;
+        self.maybe_flush()
+    }
+
+    /// Takes a snapshot of the current sequence number.
+    ///
+    /// Reads through the returned handle see exactly the writes that had been
+    /// acknowledged when it was taken, and none of the ones that land later —
+    /// for as long as the handle is alive. Holding one also pins the versions it
+    /// can reach against collection by compaction, so a long-lived snapshot
+    /// costs space; drop it when done.
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot::acquire(Arc::clone(&self.snapshots), self.visible_seq)
+    }
+
+    /// Reads the value at `key` as of the latest acknowledged write.
+    pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        self.get_at_seq(self.visible_seq, key)
+    }
+
+    /// Reads the value at `key` as of `snapshot`.
+    pub fn get_at(&self, snapshot: &Snapshot, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        self.get_at_seq(snapshot.seq(), key)
+    }
+
+    /// The visibility rule, implemented once.
+    ///
+    /// Searches newest level to oldest and stops at the first version at or
+    /// below `snapshot` — value or tombstone. Stopping on a tombstone is the
+    /// part that matters: continuing would find the value the tombstone exists
+    /// to hide and silently un-delete it.
+    pub fn get_at_seq(&self, snapshot: u64, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        if let Some(entry) = self.memtable.get(key, snapshot) {
+            return Ok(entry.value().map(<[u8]>::to_vec));
+        }
         for open in self.tables.iter().rev() {
-            match open.table.get(key)? {
-                Some(Entry::Value(v)) => return Ok(Some(v)),
-                Some(Entry::Tombstone) => return Ok(None),
-                None => {}
+            if let Some((_, entry)) = open.table.get(key, snapshot)? {
+                return Ok(entry.value().map(|v| v.to_vec()));
             }
         }
         Ok(None)
@@ -274,6 +380,16 @@ impl Db {
     /// Returns `true` if `key` currently resolves to a value.
     pub fn contains(&self, key: &[u8]) -> io::Result<bool> {
         Ok(self.get(key)?.is_some())
+    }
+
+    /// Returns the sequence number of the latest acknowledged write.
+    pub fn current_seq(&self) -> u64 {
+        self.visible_seq
+    }
+
+    /// Borrows the registry of live snapshots.
+    pub fn snapshots(&self) -> &Arc<SnapshotRegistry> {
+        &self.snapshots
     }
 
     /// Freezes the memtable and writes it to a new SSTable.
@@ -285,6 +401,10 @@ impl Db {
     /// written and fsynced, and its directory entry synced, *before* the log is
     /// rotated. Rotating first would open a window in which a crash loses every
     /// write the table was supposed to contain.
+    ///
+    /// Every version in the memtable is written, not just the newest per key —
+    /// the memtable's iteration order *is* the table's required order, and
+    /// dropping versions here would break snapshots that are still open.
     pub fn flush(&mut self) -> io::Result<Option<PathBuf>> {
         let Some(dir) = self.dir.clone() else {
             return Ok(None);
@@ -293,11 +413,11 @@ impl Db {
             return Ok(None);
         }
 
-        let seq = self.next_seq;
+        let seq = self.next_table_seq;
         let path = dir.join(table_filename(seq, 0));
         let mut writer = SsTableWriter::create(&path)?;
         for (key, entry) in self.memtable.iter() {
-            writer.append(key, entry)?;
+            writer.append(&key.user_key, key.seq, entry)?;
         }
         writer.finish()?; // fsyncs the table and its directory entry
 
@@ -311,7 +431,7 @@ impl Db {
             seq,
             generation: 0,
         });
-        self.next_seq += 1;
+        self.next_table_seq += 1;
         self.memtable.clear();
 
         if self.options.auto_compact {
@@ -360,7 +480,12 @@ impl Db {
             .iter()
             .map(SsTable::open)
             .collect::<io::Result<Vec<_>>>()?;
-        merge_into(&input_tables, &output, task.drop_tombstones)?;
+        merge_into(
+            &input_tables,
+            &output,
+            task.drop_tombstones,
+            self.oldest_snapshot(),
+        )?;
         drop(input_tables);
 
         // The output is durable now; retiring the inputs is safe.
@@ -374,6 +499,17 @@ impl Db {
 
         self.reload_tables()?;
         Ok(true)
+    }
+
+    /// The sequence number below which versions are unreachable.
+    ///
+    /// The oldest live snapshot if there is one, otherwise the current sequence
+    /// — with no readers pinned to the past, only the newest version of each key
+    /// is reachable. Taking the *minimum* is what makes this safe against a
+    /// snapshot created later: any future snapshot has a sequence number at
+    /// least this high, so anything kept for this one covers it too.
+    fn oldest_snapshot(&self) -> u64 {
+        self.snapshots.oldest().unwrap_or(self.visible_seq)
     }
 
     /// Compacts repeatedly until no tier is over its threshold.
@@ -395,9 +531,9 @@ impl Db {
     /// Re-reads the set of tables on disk.
     fn reload_tables(&mut self) -> io::Result<()> {
         if let Some(dir) = self.dir.clone() {
-            let (tables, next_seq) = discover_tables(&dir)?;
+            let (tables, next_table_seq) = discover_tables(&dir)?;
             self.tables = tables;
-            self.next_seq = self.next_seq.max(next_seq);
+            self.next_table_seq = self.next_table_seq.max(next_table_seq);
         }
         Ok(())
     }
@@ -410,30 +546,50 @@ impl Db {
         Ok(())
     }
 
-    /// Returns every live key/value pair, merged across all levels.
-    ///
-    /// Newer entries shadow older ones and tombstones remove keys entirely.
+    /// Returns every live key/value pair as of the latest acknowledged write.
     ///
     /// This materializes the whole dataset in memory and reads every table end
     /// to end. It is a diagnostic and test helper, not a hot path — a streaming
-    /// merge iterator arrives with compaction.
+    /// merge iterator is the next milestone.
     pub fn scan(&self) -> io::Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-        let mut merged: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
+        self.scan_at_seq(self.visible_seq)
+    }
 
-        // Oldest first, so newer writes overwrite older ones as we go.
-        for open in &self.tables {
+    /// Returns every live key/value pair as of `snapshot`.
+    pub fn scan_at(&self, snapshot: &Snapshot) -> io::Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+        self.scan_at_seq(snapshot.seq())
+    }
+
+    fn scan_at_seq(&self, snapshot: u64) -> io::Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+        // Newest level first, and the first version seen for a key wins — the
+        // same rule `get_at_seq` follows, applied to a whole level at a time.
+        let mut winners: BTreeMap<Vec<u8>, (u64, Entry)> = BTreeMap::new();
+
+        let mut consider = |key: Vec<u8>, seq: u64, entry: Entry| {
+            if seq > snapshot {
+                return;
+            }
+            match winners.get(&key) {
+                Some((existing, _)) if *existing >= seq => {}
+                _ => {
+                    winners.insert(key, (seq, entry));
+                }
+            }
+        };
+
+        for (key, entry) in self.memtable.iter() {
+            consider(key.user_key.clone(), key.seq, entry.clone());
+        }
+        for open in self.tables.iter().rev() {
             for item in open.table.iter()? {
-                let (key, entry) = item?;
-                merged.insert(key, entry);
+                let (key, seq, entry) = item?;
+                consider(key, seq, entry);
             }
         }
-        for (key, entry) in self.memtable.iter() {
-            merged.insert(key.clone(), entry.clone());
-        }
 
-        Ok(merged
+        Ok(winners
             .into_iter()
-            .filter_map(|(k, e)| match e {
+            .filter_map(|(k, (_, e))| match e {
                 Entry::Value(v) => Some((k, v)),
                 Entry::Tombstone => None,
             })
@@ -558,7 +714,7 @@ fn discover_tables(dir: &Path) -> io::Result<(Vec<OpenTable>, u64)> {
 
     // Oldest first: by recency slot, generation breaking ties within a slot.
     found.sort_by_key(|(seq, generation, _)| (*seq, *generation));
-    let next_seq = found.last().map_or(0, |(seq, _, _)| seq + 1);
+    let next_table_seq = found.last().map_or(0, |(seq, _, _)| seq + 1);
 
     let mut tables = Vec::with_capacity(found.len());
     for (seq, generation, path) in found {
@@ -568,7 +724,7 @@ fn discover_tables(dir: &Path) -> io::Result<(Vec<OpenTable>, u64)> {
             generation,
         });
     }
-    Ok((tables, next_seq))
+    Ok((tables, next_table_seq))
 }
 
 /// Deletes `.tmp` files left behind by an SSTable write that never finished.
@@ -610,6 +766,66 @@ mod tests {
     fn deleting_an_absent_key_is_a_no_op_for_callers() {
         let mut db = Db::new();
         assert!(!db.delete(b"nope").unwrap());
+    }
+
+    #[test]
+    fn sequence_numbers_increase_by_one_per_mutation() {
+        let mut db = Db::new();
+        assert_eq!(db.current_seq(), 0);
+        db.put(b"a", b"1").unwrap();
+        assert_eq!(db.current_seq(), 1);
+        db.put(b"b", b"2").unwrap();
+        assert_eq!(db.current_seq(), 2);
+        db.delete(b"a").unwrap();
+        assert_eq!(db.current_seq(), 3);
+    }
+
+    #[test]
+    fn a_snapshot_is_unaffected_by_later_writes() {
+        let mut db = Db::new();
+        db.put(b"k", b"v1").unwrap();
+
+        let snap = db.snapshot();
+        db.put(b"k", b"v2").unwrap();
+        db.put(b"fresh", b"new").unwrap();
+        db.delete(b"k").unwrap();
+
+        assert_eq!(db.get_at(&snap, b"k").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(db.get_at(&snap, b"fresh").unwrap(), None);
+        assert_eq!(db.get(b"k").unwrap(), None);
+        assert_eq!(db.get(b"fresh").unwrap(), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn a_snapshot_taken_before_a_delete_still_reads_the_value() {
+        let mut db = Db::new();
+        db.put(b"k", b"v").unwrap();
+        let snap = db.snapshot();
+        db.delete(b"k").unwrap();
+
+        assert_eq!(db.get(b"k").unwrap(), None);
+        assert_eq!(db.get_at(&snap, b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn scan_at_a_snapshot_sees_the_state_of_that_moment() {
+        let mut db = Db::new();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+
+        let snap = db.snapshot();
+        db.put(b"c", b"3").unwrap();
+        db.delete(b"a").unwrap();
+
+        let then = db.scan_at(&snap).unwrap();
+        assert_eq!(then.len(), 2);
+        assert_eq!(then.get(b"a".as_slice()), Some(&b"1".to_vec()));
+        assert!(!then.contains_key(b"c".as_slice()));
+
+        let now = db.scan().unwrap();
+        assert_eq!(now.len(), 2);
+        assert!(!now.contains_key(b"a".as_slice()));
+        assert!(now.contains_key(b"c".as_slice()));
     }
 
     #[test]

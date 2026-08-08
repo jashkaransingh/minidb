@@ -49,11 +49,11 @@ fn basics() -> io::Result<()> {
     println!("  get    scratch  -> {}", show(db.get(b"scratch")?));
 
     println!("\n  keys in sorted order, tombstones skipped:");
-    for (key, value) in db.memtable().iter_values() {
+    for (key, value) in db.scan()? {
         println!(
             "    {:<8} = {}",
-            String::from_utf8_lossy(key),
-            String::from_utf8_lossy(value)
+            String::from_utf8_lossy(&key),
+            String::from_utf8_lossy(&value)
         );
     }
     Ok(())

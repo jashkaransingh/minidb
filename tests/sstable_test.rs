@@ -391,16 +391,16 @@ fn a_table_written_directly_can_be_read_back() {
     let path = store.path().join("direct.sst");
 
     let mut w = SsTableWriter::create(&path).unwrap();
-    w.append(b"one", &Entry::Value(b"1".to_vec())).unwrap();
-    w.append(b"two", &Entry::Tombstone).unwrap();
+    w.append(b"one", 1, &Entry::Value(b"1".to_vec())).unwrap();
+    w.append(b"two", 2, &Entry::Tombstone).unwrap();
     let meta = w.finish().unwrap();
     assert_eq!(meta.num_entries, 2);
 
     let table = SsTable::open(&path).unwrap();
     assert_eq!(
-        table.get(b"one").unwrap(),
+        table.get_latest(b"one").unwrap(),
         Some(Entry::Value(b"1".to_vec()))
     );
-    assert_eq!(table.get(b"two").unwrap(), Some(Entry::Tombstone));
-    assert_eq!(table.get(b"three").unwrap(), None);
+    assert_eq!(table.get_latest(b"two").unwrap(), Some(Entry::Tombstone));
+    assert_eq!(table.get_latest(b"three").unwrap(), None);
 }
